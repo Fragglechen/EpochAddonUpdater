@@ -1,0 +1,4 @@
+Project Epoch Addon Updater
+
+Author: Fragglechen
+Version: 1.0.0
