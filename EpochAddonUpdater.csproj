@@ -15,8 +15,7 @@
 
   <ItemGroup>
     <Resource Include="Assets\epoch-logo.png" />
-    <Resource Include="Assets\launcher-background.png" />
-    <Resource Include="Assets\Backgrounds\*.jpg" />
+    <Resource Include="Assets\LauncherBackgrounds\*.webp" />
     <Resource Include="Assets\epoch-icon.ico" />
   </ItemGroup>
 

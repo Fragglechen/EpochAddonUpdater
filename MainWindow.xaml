@@ -263,7 +263,17 @@
             </Setter>
         </Style>
         <DataTemplate x:Key="AddonRowTemplate">
-            <Border BorderBrush="#181615" BorderThickness="0,0,0,1">
+            <Grid>
+            <Border x:Name="SectionHeader" Visibility="Collapsed" Height="54" Margin="20,0,16,0">
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="v" FontSize="14" Margin="0,0,12,0"/>
+                    <TextBlock Text="{Binding HeaderText}" Foreground="{StaticResource AccentBrush}" FontSize="18" FontWeight="SemiBold"/>
+                </StackPanel>
+            </Border>
+            <Border x:Name="AuthorHeader" Visibility="Collapsed" Height="36" Margin="48,0,16,0">
+                <TextBlock Text="{Binding HeaderText}" Foreground="#BDB8B2" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center"/>
+            </Border>
+            <Border x:Name="AddonRow" BorderBrush="#181615" BorderThickness="0,0,0,1">
                 <Grid Height="46" Margin="20,0,16,0" ClipToBounds="True">
                     <Grid.ColumnDefinitions>
                         <ColumnDefinition Width="28"/>
@@ -276,15 +286,17 @@
                     <TextBlock Grid.Column="1" Text="{Binding Title}" FontSize="13" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
                     <TextBlock Grid.Column="2" Text="{Binding ShortDescription}" FontSize="12" Foreground="#928F8D" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
                     <Button Grid.Column="3"
+                            x:Name="AddonActionButton"
                             Foreground="{Binding ActionBrush}"
                             FontWeight="{Binding ActionWeight}"
                             FontSize="12"
                             HorizontalContentAlignment="Right"
                             Padding="2,8"
                             Click="AddonAction_Click">
-                        <TextBlock Text="{Binding ActionText}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
+                        <TextBlock Text="{Binding ActionText}" FontFamily="{Binding ActionFontFamily}" TextTrimming="CharacterEllipsis" TextWrapping="NoWrap"/>
                     </Button>
                     <Button Grid.Column="4"
+                            x:Name="DeleteButton"
                             Content="&#xE74D;"
                             FontFamily="Segoe MDL2 Assets"
                             Foreground="#A82525"
@@ -297,12 +309,27 @@
                             Click="DeleteAddon_Click"/>
                 </Grid>
             </Border>
+            </Grid>
+            <DataTemplate.Triggers>
+                <DataTrigger Binding="{Binding RowKind}" Value="SectionHeader">
+                    <Setter TargetName="SectionHeader" Property="Visibility" Value="Visible"/>
+                    <Setter TargetName="AddonRow" Property="Visibility" Value="Collapsed"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding RowKind}" Value="AuthorHeader">
+                    <Setter TargetName="AuthorHeader" Property="Visibility" Value="Visible"/>
+                    <Setter TargetName="AddonRow" Property="Visibility" Value="Collapsed"/>
+                </DataTrigger>
+                <DataTrigger Binding="{Binding IsRecommended}" Value="True">
+                    <Setter TargetName="DeleteButton" Property="Visibility" Value="Collapsed"/>
+                    <Setter TargetName="AddonActionButton" Property="Foreground" Value="#D9DD51"/>
+                </DataTrigger>
+            </DataTemplate.Triggers>
         </DataTemplate>
     </Window.Resources>
 
     <Grid>
         <Grid.Background>
-            <ImageBrush x:Name="LauncherBackgroundBrush" ImageSource="Assets/launcher-background.png" Stretch="UniformToFill"/>
+            <ImageBrush x:Name="LauncherBackgroundBrush" ImageSource="Assets/LauncherBackgrounds/launcher-background-01.webp" Stretch="UniformToFill"/>
         </Grid.Background>
 
         <Border Background="#70000000"/>
@@ -344,10 +371,6 @@
                         <RowDefinition Height="64"/>
                     </Grid.RowDefinitions>
                     <Grid Grid.Row="0" Margin="28,0,20,0">
-                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                            <TextBlock Text="v" FontSize="14" Margin="0,0,12,0"/>
-                            <TextBlock Text="INSTALLED" Foreground="{StaticResource AccentBrush}" FontSize="18" FontWeight="SemiBold"/>
-                        </StackPanel>
                         <Grid Width="260" HorizontalAlignment="Right" VerticalAlignment="Center">
                             <TextBox x:Name="SearchBox" Style="{StaticResource InputBox}" TextChanged="SearchBox_TextChanged"/>
                             <TextBlock Text="&#xE721;" FontFamily="Segoe MDL2 Assets" FontSize="20" Foreground="#F4F0EA" HorizontalAlignment="Right" VerticalAlignment="Center" Margin="0,0,11,0" IsHitTestVisible="False"/>

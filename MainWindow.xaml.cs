@@ -26,6 +26,7 @@ public partial class MainWindow : Window
 {
     private const string ExpectedInterface = "30300";
     private readonly ObservableCollection<AddonInfo> _addons = [];
+    private readonly ObservableCollection<AddonInfo> _recommendedAddons = [];
     private readonly ObservableCollection<AddonInfo> _visibleAddons = [];
     private readonly HttpClient _http = new();
     private AppSettings _settings = new();
@@ -46,13 +47,14 @@ public partial class MainWindow : Window
 
     private void ApplyRandomBackground()
     {
-        const int backgroundCount = 316;
+        const int backgroundCount = 10;
         var index = Random.Shared.Next(1, backgroundCount + 1);
-        LauncherBackgroundBrush.ImageSource = new BitmapImage(new Uri($"pack://application:,,,/Assets/Backgrounds/background-{index:000}.jpg", UriKind.Absolute));
+        LauncherBackgroundBrush.ImageSource = new BitmapImage(new Uri($"pack://application:,,,/Assets/LauncherBackgrounds/launcher-background-{index:00}.webp", UriKind.Absolute));
     }
 
     private async Task InitializeAsync()
     {
+        AppLogger.Info("Main window initialization started.");
         _http.DefaultRequestHeaders.UserAgent.ParseAdd("EpochAddonUpdater/1.0");
         LoadSettings();
         VersionButton.Content = new StackPanel
@@ -67,11 +69,25 @@ public partial class MainWindow : Window
         StartProcessWatcher();
         LoadAddonPlaceholders();
         await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
-        _ = ScanAsync(checkRemote: true);
+        RunLoggedAsync(ScanAsync(checkRemote: true), "Initial scan");
+        AppLogger.Info("Main window initialization finished.");
+    }
+
+    private static async void RunLoggedAsync(Task task, string operation)
+    {
+        try
+        {
+            await task;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error($"{operation} failed.", ex);
+        }
     }
 
     private void LoadSettings()
     {
+        AppLogger.Info("Loading settings.");
         var dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "EpochAddonUpdater");
         Directory.CreateDirectory(dir);
         _settingsPath = Path.Combine(dir, "settings.json");
@@ -92,12 +108,18 @@ public partial class MainWindow : Window
             _settings.LauncherExecutable = @"D:\spiele\Ascension-WOW\Launcher\Ascension Launcher.exe";
         }
 
+        if (!_settings.FavoriteAuthorUrls.Contains("https://github.com/Fragglechen", StringComparer.OrdinalIgnoreCase))
+        {
+            _settings.FavoriteAuthorUrls.Add("https://github.com/Fragglechen");
+        }
+
         SaveSettings();
     }
 
     private void SaveSettings()
     {
         File.WriteAllText(_settingsPath, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
+        AppLogger.Info($"Settings saved to {_settingsPath}.");
     }
 
     private void LoadAddonPlaceholders()
@@ -142,6 +164,7 @@ public partial class MainWindow : Window
 
     private async Task ScanAsync(bool checkRemote)
     {
+        AppLogger.Info($"Scan started. checkRemote={checkRemote}");
         _scanInProgress = true;
         SetFooterStatus(checkRemote ? "Verifying addons and checking remotes..." : "Verifying addons...");
         try
@@ -156,7 +179,7 @@ public partial class MainWindow : Window
             }
 
             var dirs = GetAddonDirectories(addonRoot);
-            var folderNames = dirs.Select(Path.GetFileName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var folderNames = dirs.Select(Path.GetFileName).Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n!).ToHashSet(StringComparer.OrdinalIgnoreCase);
             foreach (var removed in _addons.Where(a => !folderNames.Contains(a.FolderName)).ToList())
             {
                 _addons.Remove(removed);
@@ -232,6 +255,7 @@ public partial class MainWindow : Window
                     await Dispatcher.InvokeAsync(() => Progress.Value = 70 + done * 25.0 / Math.Max(1, gitAddons.Count));
                 }).ToList();
                 await Task.WhenAll(remoteTasks);
+                await LoadRecommendedAddonsAsync(folderNames);
             }
 
             Progress.Value = 100;
@@ -239,6 +263,12 @@ public partial class MainWindow : Window
             SetFooterStatus(_addons.Count(a => a.HasUpdate) > 0 ? "Updates available!" : "Everything up to date!");
             NotifyAllAddons();
             RenderAddons();
+            AppLogger.Info($"Scan finished. Installed={_addons.Count}, Recommended={_recommendedAddons.Count}, Updates={_addons.Count(a => a.HasUpdate)}");
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("Scan failed.", ex);
+            SetFooterStatus("Scan failed.", ex.Message);
         }
         finally
         {
@@ -463,6 +493,186 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task LoadRecommendedAddonsAsync(HashSet<string> installedFolderNames)
+    {
+        AppLogger.Info("Loading recommended addons.");
+        _recommendedAddons.Clear();
+        var authorUrls = _settings.FavoriteAuthorUrls
+            .Where(u => !string.IsNullOrWhiteSpace(u))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (authorUrls.Count == 0)
+        {
+            RenderAddons();
+            return;
+        }
+
+        SetFooterStatus("Checking favorite authors...");
+        var installedRepos = _addons
+            .Select(a => NormalizeRepo(a.RepositoryUrl))
+            .Where(r => !string.IsNullOrWhiteSpace(r))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        using var gate = new System.Threading.SemaphoreSlim(4);
+        var tasks = authorUrls.Select(async url =>
+        {
+            await gate.WaitAsync();
+            try
+            {
+                return await LoadAuthorRecommendationsAsync(url, installedFolderNames, installedRepos);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }).ToList();
+
+        foreach (var task in tasks)
+        {
+            List<AddonInfo> loaded;
+            try
+            {
+                loaded = await task;
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error("Loading recommendations for a favorite author failed.", ex);
+                continue;
+            }
+            foreach (var addon in loaded)
+            {
+                if (_recommendedAddons.Any(a => NormalizeRepo(a.RepositoryUrl) == NormalizeRepo(addon.RepositoryUrl)))
+                {
+                    continue;
+                }
+                _recommendedAddons.Add(addon);
+            }
+        }
+        AppLogger.Info($"Recommended addons loaded. Count={_recommendedAddons.Count}");
+        RenderAddons();
+    }
+
+    private async Task<List<AddonInfo>> LoadAuthorRecommendationsAsync(string authorUrl, HashSet<string> installedFolderNames, HashSet<string> installedRepos)
+    {
+        AppLogger.Info($"Checking favorite author URL: {authorUrl}");
+        var result = new List<AddonInfo>();
+        var repos = await GetFavoriteAuthorRepositoriesAsync(authorUrl);
+        foreach (var repo in repos)
+        {
+            if (installedRepos.Contains(NormalizeRepo(repo.Url)) || installedFolderNames.Contains(repo.Name))
+            {
+                continue;
+            }
+            var preview = await PreviewRepositoryAsync(repo.Url, repo.DefaultBranch, requireToc: true);
+            if (preview is null || string.IsNullOrWhiteSpace(preview.Title))
+            {
+                continue;
+            }
+            if (installedFolderNames.Contains(preview.Title))
+            {
+                continue;
+            }
+            result.Add(new AddonInfo
+            {
+                FolderName = repo.Name,
+                Title = preview.Title,
+                Description = preview.Description,
+                Author = repo.Author,
+                Version = preview.Version,
+                RepositoryUrl = repo.Url,
+                Branch = preview.Branch,
+                IsRecommended = true,
+                Status = AddonStatus.Ok,
+                StatusText = "\uE896"
+            });
+        }
+        AppLogger.Info($"Favorite author URL checked: {authorUrl}. Recommendations={result.Count}");
+        return result;
+    }
+
+    private async Task<List<FavoriteRepository>> GetFavoriteAuthorRepositoriesAsync(string url)
+    {
+        var result = new List<FavoriteRepository>();
+        if (TryParseGitHub(url, out var owner, out var repo))
+        {
+            var repoInfo = await GetGitHubRepositoryInfo(owner, repo);
+            if (repoInfo is null || !repoInfo.IsLua)
+            {
+                return result;
+            }
+            var branch = repoInfo.DefaultBranch;
+            result.Add(new FavoriteRepository(owner, repo, $"https://github.com/{owner}/{repo}", branch));
+            return result;
+        }
+        if (!TryParseGitHubOwner(url, out owner))
+        {
+            return result;
+        }
+
+        var json = await TryHttpString($"https://api.github.com/users/{owner}/repos?per_page=100&type=owner&sort=updated");
+        if (json is null)
+        {
+            return result;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            foreach (var item in doc.RootElement.EnumerateArray())
+            {
+                if (item.TryGetProperty("fork", out var fork) && fork.GetBoolean())
+                {
+                    continue;
+                }
+                if (item.TryGetProperty("private", out var isPrivate) && isPrivate.GetBoolean())
+                {
+                    continue;
+                }
+                var language = item.TryGetProperty("language", out var languageElement) ? languageElement.GetString() ?? "" : "";
+                if (!language.Equals("Lua", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                var name = item.GetProperty("name").GetString() ?? "";
+                var repoOwner = item.GetProperty("owner").GetProperty("login").GetString() ?? owner;
+                var htmlUrl = item.GetProperty("html_url").GetString() ?? $"https://github.com/{repoOwner}/{name}";
+                var defaultBranch = item.TryGetProperty("default_branch", out var branch) ? branch.GetString() ?? "main" : "main";
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    result.Add(new FavoriteRepository(repoOwner, name, htmlUrl, defaultBranch));
+                }
+            }
+        }
+        catch
+        {
+            return [];
+        }
+        return result;
+    }
+
+    private async Task<GitHubRepositoryInfo?> GetGitHubRepositoryInfo(string owner, string repo)
+    {
+        var json = await TryHttpString($"https://api.github.com/repos/{owner}/{repo}");
+        if (json is null)
+        {
+            return null;
+        }
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("private", out var isPrivate) && isPrivate.GetBoolean())
+            {
+                return null;
+            }
+            var language = doc.RootElement.TryGetProperty("language", out var languageElement) ? languageElement.GetString() ?? "" : "";
+            var defaultBranch = doc.RootElement.TryGetProperty("default_branch", out var branch) ? branch.GetString() ?? "main" : "main";
+            return new GitHubRepositoryInfo(defaultBranch, language.Equals("Lua", StringComparison.OrdinalIgnoreCase));
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private static Dictionary<string, string> ParseRemoteHeads(string output)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
@@ -482,9 +692,32 @@ public partial class MainWindow : Window
         var filter = SearchBox.Text?.Trim() ?? "";
         var selected = AddonList.SelectedItem as AddonInfo;
         _visibleAddons.Clear();
-        foreach (var addon in _addons.Where(a => string.IsNullOrWhiteSpace(filter) || a.Title.Contains(filter, StringComparison.OrdinalIgnoreCase) || a.FolderName.Contains(filter, StringComparison.OrdinalIgnoreCase)))
+        var installed = _addons
+            .Where(a => MatchesFilter(a, filter))
+            .OrderBy(a => string.IsNullOrWhiteSpace(a.Title) ? a.FolderName : a.Title, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var recommended = _recommendedAddons.Where(a => MatchesFilter(a, filter)).ToList();
+
+        if (installed.Count > 0 || string.IsNullOrWhiteSpace(filter))
+        {
+            _visibleAddons.Add(AddonInfo.Section("INSTALLED"));
+        }
+        foreach (var addon in installed)
         {
             _visibleAddons.Add(addon);
+        }
+
+        if (recommended.Count > 0)
+        {
+            _visibleAddons.Add(AddonInfo.Section("RECOMMENDED"));
+            foreach (var group in recommended.GroupBy(a => string.IsNullOrWhiteSpace(a.Author) ? "Unknown Author" : a.Author).OrderBy(g => g.Key))
+            {
+                _visibleAddons.Add(AddonInfo.AuthorHeader(group.Key));
+                foreach (var addon in group.OrderBy(a => a.Title))
+                {
+                    _visibleAddons.Add(addon);
+                }
+            }
         }
 
         if (selected is not null && _visibleAddons.Contains(selected))
@@ -498,6 +731,14 @@ public partial class MainWindow : Window
         UpdateAllButton.Content = updateCount > 0 ? "Update all" : "Everything is up to date.";
         UpdateAllButton.Foreground = updateCount > 0 ? Brush("#D9DD51") : Brush("#9B9A9A");
         UpdateAllButton.IsEnabled = updateCount > 0;
+    }
+
+    private static bool MatchesFilter(AddonInfo addon, string filter)
+    {
+        return string.IsNullOrWhiteSpace(filter)
+            || addon.Title.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || addon.FolderName.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || addon.Author.Contains(filter, StringComparison.OrdinalIgnoreCase);
     }
 
     private void NotifyAllAddons()
@@ -515,6 +756,10 @@ public partial class MainWindow : Window
         {
             await UpdateAddonAsync(addon, addon.RepositoryUrl, addon.Branch, replaceUrl: false);
         }
+        else if ((sender as FrameworkElement)?.DataContext is AddonInfo recommended && recommended.IsRecommended)
+        {
+            await UpdateAddonAsync(null, recommended.RepositoryUrl, recommended.Branch, replaceUrl: true);
+        }
     }
 
     private async void DeleteAddon_Click(object sender, RoutedEventArgs e)
@@ -525,13 +770,238 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (MessageBox.Show($"Delete addon folder '{addon.FolderName}'?", "Delete addon", MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+        if (await ShowDeleteConfirmationAsync(addon))
         {
-            Directory.Delete(addon.FolderPath, recursive: true);
-            _addons.Remove(addon);
-            RenderAddons();
-            await ScanAsync(checkRemote: false);
+            try
+            {
+                AppLogger.Info($"Deleting addon. Title={addon.Title}; Path={addon.FolderPath}");
+                if (Directory.Exists(addon.FolderPath))
+                {
+                    DeleteDirectoryForce(addon.FolderPath);
+                }
+                _addons.Remove(addon);
+                RenderAddons();
+                await ScanAsync(checkRemote: false);
+                AppLogger.Info($"Addon deleted. Title={addon.Title}");
+            }
+            catch (Exception ex)
+            {
+                AppLogger.Error($"Delete failed. Title={addon.Title}; Path={addon.FolderPath}", ex);
+                var hint = "This usually means the addon folder is open in another app, WoW/the launcher is still using a file, or Windows marked one of the files as read-only.";
+                SetFooterStatus("Delete failed.", ex.Message);
+                await ShowInfoDialogAsync("DELETE FAILED", $"Could not delete {addon.Title}.\n\n{ex.Message}\n\n{hint}");
+            }
         }
+    }
+
+    private static void DeleteDirectoryForce(string path)
+    {
+        foreach (var file in Directory.GetFiles(path, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+        foreach (var directory in Directory.GetDirectories(path, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(directory, FileAttributes.Normal);
+        }
+        Directory.Delete(path, recursive: true);
+    }
+
+    private Task ShowInfoDialogAsync(string title, string message)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        Overlay.Children.Clear();
+        Overlay.Visibility = Visibility.Visible;
+
+        var panel = new Border
+        {
+            Width = 680,
+            Height = 360,
+            Background = Brush("#EA0F0D0C"),
+            BorderBrush = Brush("#302C29"),
+            BorderThickness = new Thickness(1),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var root = new Grid();
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(82) });
+        root.RowDefinitions.Add(new RowDefinition());
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(70) });
+
+        var header = new Grid { Margin = new Thickness(24, 0, 14, 0) };
+        header.Children.Add(new TextBlock
+        {
+            Text = title,
+            Foreground = Brush("#FF9146"),
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 30,
+            FontWeight = FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        var close = new Button
+        {
+            Content = "\uE8BB",
+            FontFamily = new FontFamily("Segoe MDL2 Assets"),
+            FontSize = 18,
+            Foreground = Brush("#F4F0EA"),
+            Width = 44,
+            Height = 44,
+            Padding = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        close.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(true); };
+        header.Children.Add(close);
+        root.Children.Add(header);
+
+        var body = new Border
+        {
+            BorderBrush = Brush("#24201D"),
+            BorderThickness = new Thickness(0, 1, 0, 1),
+            Padding = new Thickness(24, 14, 24, 14),
+            Child = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                Content = new TextBox
+                {
+                    Text = message,
+                    FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+                    FontSize = 15,
+                    Foreground = Brush("#BDB8B2"),
+                    Background = Brushes.Transparent,
+                    BorderThickness = new Thickness(0),
+                    IsReadOnly = true,
+                    TextWrapping = TextWrapping.Wrap,
+                    AcceptsReturn = true,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+                }
+            }
+        };
+        Grid.SetRow(body, 1);
+        root.Children.Add(body);
+
+        var ok = new Button
+        {
+            Content = "OK",
+            Foreground = Brush("#D9DD51"),
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 18,
+            FontWeight = FontWeights.SemiBold,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 28, 0)
+        };
+        ok.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(true); };
+        Grid.SetRow(ok, 2);
+        root.Children.Add(ok);
+
+        panel.Child = root;
+        Overlay.Children.Add(panel);
+        return tcs.Task;
+    }
+
+    private Task<bool> ShowDeleteConfirmationAsync(AddonInfo addon)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        Overlay.Children.Clear();
+        Overlay.Visibility = Visibility.Visible;
+
+        var panel = new Border
+        {
+            Width = 620,
+            Height = 322,
+            Background = Brush("#EA0F0D0C"),
+            BorderBrush = Brush("#302C29"),
+            BorderThickness = new Thickness(1),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var root = new Grid();
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(106) });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(126) });
+        root.RowDefinitions.Add(new RowDefinition());
+
+        var header = new Grid { Margin = new Thickness(24, 0, 14, 0) };
+        var titleBrush = new LinearGradientBrush
+        {
+            StartPoint = new Point(0, 0),
+            EndPoint = new Point(1, 0),
+            GradientStops =
+            {
+                new GradientStop(Color.FromRgb(255, 118, 63), 0),
+                new GradientStop(Color.FromRgb(255, 156, 62), 0.55),
+                new GradientStop(Color.FromRgb(244, 194, 70), 1)
+            }
+        };
+        header.Children.Add(new TextBlock
+        {
+            Text = "ARE YOU SURE?",
+            Foreground = titleBrush,
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 40,
+            FontWeight = FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        var close = new Button
+        {
+            Content = "\uE8BB",
+            FontFamily = new FontFamily("Segoe MDL2 Assets"),
+            FontSize = 18,
+            Foreground = Brush("#F4F0EA"),
+            Width = 44,
+            Height = 44,
+            Padding = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        close.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(false); };
+        header.Children.Add(close);
+        root.Children.Add(header);
+
+        var body = new Border
+        {
+            BorderBrush = Brush("#24201D"),
+            BorderThickness = new Thickness(0, 1, 0, 1),
+            Padding = new Thickness(24, 24, 24, 0)
+        };
+        var text = new TextBlock
+        {
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 21,
+            Foreground = Brush("#9B9A9A"),
+            TextWrapping = TextWrapping.Wrap,
+            LineHeight = 34
+        };
+        text.Inlines.Add(new Run("Are you sure you want to delete "));
+        text.Inlines.Add(new Run(addon.Title) { Foreground = Brush("#F4F0EA"), FontWeight = FontWeights.SemiBold });
+        text.Inlines.Add(new Run(" addon?\nThis will delete all files in the addon folder."));
+        body.Child = text;
+        Grid.SetRow(body, 1);
+        root.Children.Add(body);
+
+        var footer = new Grid { Margin = new Thickness(24, 0, 28, 0) };
+        var delete = new Button
+        {
+            Foreground = Brush("#FF3939"),
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 22,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var deleteContent = new StackPanel { Orientation = Orientation.Horizontal };
+        deleteContent.Children.Add(new TextBlock { Text = "\uE74D", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 28, Margin = new Thickness(0, 0, 14, 0), VerticalAlignment = VerticalAlignment.Center });
+        deleteContent.Children.Add(new TextBlock { Text = "Delete", VerticalAlignment = VerticalAlignment.Center });
+        delete.Content = deleteContent;
+        delete.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(true); };
+        footer.Children.Add(delete);
+        Grid.SetRow(footer, 2);
+        root.Children.Add(footer);
+
+        panel.Child = root;
+        Overlay.Children.Add(panel);
+        return tcs.Task;
     }
 
     private void AddonList_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -539,6 +1009,14 @@ public partial class MainWindow : Window
         if (AddonList.SelectedItem is AddonInfo addon)
         {
             AddonList.SelectedItem = null;
+            if (addon.IsHeader)
+            {
+                return;
+            }
+            if (addon.IsRecommended)
+            {
+                return;
+            }
             ShowAddonDetails(addon);
         }
     }
@@ -857,7 +1335,7 @@ public partial class MainWindow : Window
         body.Children.Add(root);
 
         stack.Children.Add(SectionTitle("Install Location:"));
-        stack.Children.Add(PathEditor(_settings.InstallLocation, "Select folder", isFolder: true, v => { _settings.InstallLocation = v; SaveSettings(); _ = ScanAsync(checkRemote: false); },
+        stack.Children.Add(PathEditor(_settings.InstallLocation, "Select folder", isFolder: true, v => { _settings.InstallLocation = v; SaveSettings(); RunLoggedAsync(ScanAsync(checkRemote: false), "Settings install location scan"); },
             "Please add the path until the folder where you see the subfolder \"Interface\" e.g. \"D:\\spiele\\Ascension-WOW\\Launcher\\resources\\epoch-live\\\""));
 
         stack.Children.Add(SectionTitle("Game Start:"));
@@ -872,6 +1350,9 @@ public partial class MainWindow : Window
         stack.Children.Add(PathEditor(_settings.LauncherExecutable, "Select file", isFolder: false, v => { _settings.LauncherExecutable = v; SaveSettings(); }, "Launcher executable"));
         stack.Children.Add(PathEditor(_settings.WowExecutable, "Select file", isFolder: false, v => { _settings.WowExecutable = v; SaveSettings(); }, "WOW executable"));
 
+        stack.Children.Add(SectionTitle("Favorite Authors"));
+        stack.Children.Add(BuildFavoriteAuthorsSettings());
+
         stack.Children.Add(SectionTitle("Troubleshooting:"));
         stack.Children.Add(LinkButton("Open log file", () =>
         {
@@ -885,6 +1366,94 @@ public partial class MainWindow : Window
         clean.Checked += (_, _) => { _settings.CleanWdbOnLaunch = true; SaveSettings(); };
         clean.Unchecked += (_, _) => { _settings.CleanWdbOnLaunch = false; SaveSettings(); };
         stack.Children.Add(clean);
+    }
+
+    private FrameworkElement BuildFavoriteAuthorsSettings()
+    {
+        var panel = new StackPanel { Margin = new Thickness(0, 8, 0, 22) };
+        var inputRow = new Grid();
+        inputRow.ColumnDefinitions.Add(new ColumnDefinition());
+        inputRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) });
+        var input = new TextBox { Style = (Style)FindResource("InputBox"), FontSize = 13 };
+        var add = new Button
+        {
+            Content = "+",
+            Foreground = Brush("#A8CE3A"),
+            FontSize = 24,
+            FontWeight = FontWeights.Bold,
+            Padding = new Thickness(0),
+            HorizontalContentAlignment = HorizontalAlignment.Center
+        };
+        Grid.SetColumn(add, 1);
+        inputRow.Children.Add(input);
+        inputRow.Children.Add(add);
+        panel.Children.Add(inputRow);
+
+        var list = new StackPanel { Margin = new Thickness(0, 10, 0, 0) };
+        panel.Children.Add(list);
+
+        void Render()
+        {
+            list.Children.Clear();
+            foreach (var url in _settings.FavoriteAuthorUrls.OrderBy(u => u, StringComparer.OrdinalIgnoreCase).ToList())
+            {
+                var row = new Grid { Margin = new Thickness(0, 2, 0, 2) };
+                row.ColumnDefinitions.Add(new ColumnDefinition());
+                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(48) });
+                row.Children.Add(new TextBlock
+                {
+                    Text = url,
+                    Foreground = Brush("#BDB8B2"),
+                    FontSize = 13,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    TextTrimming = TextTrimming.CharacterEllipsis
+                });
+                var remove = new Button
+                {
+                    Content = "-",
+                    Foreground = Brush("#FF3939"),
+                    FontSize = 24,
+                    FontWeight = FontWeights.Bold,
+                    Padding = new Thickness(0),
+                    HorizontalContentAlignment = HorizontalAlignment.Center
+                };
+                remove.Click += (_, _) =>
+                {
+                    _settings.FavoriteAuthorUrls.RemoveAll(u => u.Equals(url, StringComparison.OrdinalIgnoreCase));
+                    SaveSettings();
+                    Render();
+                    RunLoggedAsync(ScanAsync(checkRemote: true), "Favorite authors scan after remove");
+                };
+                Grid.SetColumn(remove, 1);
+                row.Children.Add(remove);
+                list.Children.Add(row);
+            }
+        }
+
+        add.Click += (_, _) =>
+        {
+            var url = input.Text.Trim();
+            if (string.IsNullOrWhiteSpace(url) || _settings.FavoriteAuthorUrls.Contains(url, StringComparer.OrdinalIgnoreCase))
+            {
+                return;
+            }
+            _settings.FavoriteAuthorUrls.Add(url);
+            SaveSettings();
+            input.Clear();
+            Render();
+            RunLoggedAsync(ScanAsync(checkRemote: true), "Favorite authors scan after add");
+        };
+
+        Render();
+        panel.Children.Add(new TextBlock
+        {
+            Text = "Add GitHub author, organization, or repository URLs. Public repositories with addon metadata will appear as recommendations.",
+            Foreground = Brush("#8E8B87"),
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 8, 0, 0)
+        });
+        return panel;
     }
 
     private FrameworkElement PathEditor(string current, string chooserText, bool isFolder, Action<string> apply, string help)
@@ -925,18 +1494,22 @@ public partial class MainWindow : Window
         return panel;
     }
 
-    private async Task<RepoPreview?> PreviewRepositoryAsync(string url)
+    private async Task<RepoPreview?> PreviewRepositoryAsync(string url, string? branchHint = null, bool requireToc = false)
     {
         if (string.IsNullOrWhiteSpace(url))
         {
             return null;
         }
 
-        var heads = await RunGitAsync(_settings.InstallLocation, $"ls-remote --heads {url}");
-        var branch = heads.Split("refs/heads/").Skip(1).Select(s => s.Split(['\r', '\n']).First().Trim()).FirstOrDefault() ?? "main";
-        if (string.IsNullOrWhiteSpace(heads))
+        var branch = string.IsNullOrWhiteSpace(branchHint) ? "" : branchHint;
+        if (string.IsNullOrWhiteSpace(branch))
         {
-            return null;
+            var heads = await RunGitAsync(_settings.InstallLocation, $"ls-remote --heads {url}");
+            branch = heads.Split("refs/heads/").Skip(1).Select(s => s.Split(['\r', '\n']).First().Trim()).FirstOrDefault() ?? "main";
+            if (string.IsNullOrWhiteSpace(heads))
+            {
+                return null;
+            }
         }
 
         var preview = new RepoPreview { Url = url, Branch = branch };
@@ -944,6 +1517,10 @@ public partial class MainWindow : Window
         {
             var readme = await TryHttpString($"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/README.md");
             var toc = await FindRemoteToc(owner, repo, branch);
+            if (requireToc && toc is null)
+            {
+                return null;
+            }
             preview.Title = repo;
             preview.Description = FirstMarkdownParagraph(readme) ?? "Repository is available.";
             if (toc is not null)
@@ -978,6 +1555,7 @@ public partial class MainWindow : Window
         }
 
         branch = string.IsNullOrWhiteSpace(branch) ? "main" : branch;
+        AppLogger.Info($"Update/install started. Repo={repoUrl}; Branch={branch}; ExistingAddon={addon?.FolderName ?? "<new>"}");
         SetFooterStatus($"Downloading {repoUrl}...");
         if (!TryParseGitHub(repoUrl, out var owner, out var repo))
         {
@@ -1005,16 +1583,18 @@ public partial class MainWindow : Window
 
             if (Directory.Exists(target))
             {
-                Directory.Delete(target, recursive: true);
+                DeleteDirectoryForce(target);
             }
             CopyDirectory(source, target);
             var installedCommit = await RunGitAsync(_settings.InstallLocation, $"ls-remote {repoUrl} refs/heads/{branch}");
             SaveRepoMetadata(target, repoUrl, branch, installedCommit.Split(['\t', ' '], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "");
             SetFooterStatus("Addon updated.");
             await ScanAsync(checkRemote: true);
+            AppLogger.Info($"Update/install finished. Repo={repoUrl}; Target={target}");
         }
         catch (Exception ex)
         {
+            AppLogger.Error($"Update/install failed. Repo={repoUrl}; Target={target}", ex);
             MessageBox.Show(ex.Message, "Update failed", MessageBoxButton.OK, MessageBoxImage.Error);
             SetFooterStatus("Update failed.");
         }
@@ -1022,7 +1602,7 @@ public partial class MainWindow : Window
         {
             if (Directory.Exists(temp))
             {
-                Directory.Delete(temp, recursive: true);
+                DeleteDirectoryForce(temp);
             }
         }
     }
@@ -1048,6 +1628,7 @@ public partial class MainWindow : Window
         }
         catch
         {
+            AppLogger.Warn($"Failed to read repo metadata: {metadataPath}");
             // Bad metadata should not make the addon fail verification.
         }
     }
@@ -1390,13 +1971,19 @@ public partial class MainWindow : Window
             if (await Task.WhenAny(exitTask, Task.Delay(3500)) != exitTask)
             {
                 try { process.Kill(entireProcessTree: true); } catch { }
+                AppLogger.Warn($"Git timed out. WorkingDirectory={workingDirectory}; Args={args}");
                 return "";
             }
             var output = await outputTask;
+            if (process.ExitCode != 0)
+            {
+                AppLogger.Warn($"Git failed. ExitCode={process.ExitCode}; WorkingDirectory={workingDirectory}; Args={args}");
+            }
             return process.ExitCode == 0 ? output.Trim() : "";
         }
-        catch
+        catch (Exception ex)
         {
+            AppLogger.Error($"Git execution failed. WorkingDirectory={workingDirectory}; Args={args}", ex);
             return "";
         }
     }
@@ -1404,7 +1991,11 @@ public partial class MainWindow : Window
     private async Task<string?> TryHttpString(string url)
     {
         try { return await _http.GetStringAsync(url); }
-        catch { return null; }
+        catch (Exception ex)
+        {
+            AppLogger.Warn($"HTTP GET failed. Url={url}; Error={ex.Message}");
+            return null;
+        }
     }
 
     private static bool TryParseGitHub(string url, out string owner, out string repo)
@@ -1416,6 +2007,22 @@ public partial class MainWindow : Window
         owner = match.Groups["owner"].Value;
         repo = match.Groups["repo"].Value;
         return true;
+    }
+
+    private static bool TryParseGitHubOwner(string url, out string owner)
+    {
+        owner = "";
+        var match = Regex.Match(url.Trim(), @"github\.com[:/](?<owner>[^/\s]+)(?:/)?$", RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            match = Regex.Match(url.Trim(), @"^(?<owner>[A-Za-z0-9_.-]+)$", RegexOptions.IgnoreCase);
+        }
+        if (!match.Success)
+        {
+            return false;
+        }
+        owner = match.Groups["owner"].Value.Trim();
+        return !string.IsNullOrWhiteSpace(owner);
     }
 
     private static string NormalizeRepo(string? url)
@@ -1470,6 +2077,10 @@ public sealed class AddonInfo : INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
 
+    public string RowKind { get; set; } = "Addon";
+    public string HeaderText { get; set; } = "";
+    public bool IsHeader => RowKind != "Addon";
+    public bool IsRecommended { get; set; }
     public string FolderName { get; set; } = "";
     public string FolderPath { get; set; } = "";
     public string TocPath { get; set; } = "";
@@ -1491,16 +2102,20 @@ public sealed class AddonInfo : INotifyPropertyChanged
     public List<string> Branches { get; set; } = [];
     public List<DependencyInfo> Dependencies { get; } = [];
     public string ShortDescription => string.IsNullOrWhiteSpace(Description) ? "" : Regex.Replace(Clean(Description), @"\s+", " ");
-    public string IconText => Status is AddonStatus.Failed or AddonStatus.MissingDependencies or AddonStatus.OutOfDate ? "!" : "?";
+    public string IconText => IsRecommended ? "+" : Status is AddonStatus.Failed or AddonStatus.MissingDependencies or AddonStatus.OutOfDate ? "!" : "?";
     public Brush IconBrush => Status == AddonStatus.Failed ? Solid("#FF3939") : Status == AddonStatus.Ok ? Solid("#9B9A9A") : Solid("#F0CC17");
-    public string ActionText => HasUpdate && !IgnoreUpdates ? "Update" : StatusText;
+    public string ActionText => IsRecommended ? "\uE896" : HasUpdate && !IgnoreUpdates ? "Update" : StatusText;
     public Brush ActionBrush => Status switch
     {
         AddonStatus.Failed => Solid("#FF3939"),
         AddonStatus.MissingDependencies or AddonStatus.OutOfDate => Solid("#F0CC17"),
-        _ => HasUpdate ? Solid("#F4F0EA") : Solid("#A8CE3A")
+        _ => IsRecommended ? Solid("#D9DD51") : HasUpdate ? Solid("#F4F0EA") : Solid("#A8CE3A")
     };
-    public FontWeight ActionWeight => HasUpdate ? FontWeights.Bold : FontWeights.Normal;
+    public FontWeight ActionWeight => HasUpdate || IsRecommended ? FontWeights.Bold : FontWeights.Normal;
+    public string ActionFontFamily => IsRecommended ? "Segoe MDL2 Assets" : "Segoe UI";
+
+    public static AddonInfo Section(string text) => new() { RowKind = "SectionHeader", HeaderText = text, Title = text };
+    public static AddonInfo AuthorHeader(string text) => new() { RowKind = "AuthorHeader", HeaderText = text, Title = text };
 
     public void RefreshBindings()
     {
@@ -1526,6 +2141,7 @@ public sealed class AppSettings
     public string WowExecutable { get; set; } = "";
     public bool CleanWdbOnLaunch { get; set; }
     public List<string> IgnoredAddons { get; set; } = [];
+    public List<string> FavoriteAuthorUrls { get; set; } = ["https://github.com/Fragglechen"];
 }
 
 public sealed class RepoPreview
@@ -1545,3 +2161,7 @@ public sealed class RepoInstallMetadata
     public string Commit { get; set; } = "";
     public DateTimeOffset InstalledAt { get; set; }
 }
+
+public sealed record FavoriteRepository(string Author, string Name, string Url, string DefaultBranch);
+
+public sealed record GitHubRepositoryInfo(string DefaultBranch, bool IsLua);
