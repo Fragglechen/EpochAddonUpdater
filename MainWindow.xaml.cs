@@ -34,6 +34,8 @@ public partial class MainWindow : Window
     private string _normalFooterTitle = "Scanning addons...";
     private string _normalFooterSubtitle = "";
     private bool _launchTargetRunning;
+    private bool _launcherRunning;
+    private bool _wowRunning;
     private bool _scanInProgress;
     private DispatcherTimer? _processTimer;
 
@@ -1657,38 +1659,60 @@ public partial class MainWindow : Window
     private async void Play_Click(object sender, RoutedEventArgs e)
     {
         ApplyLaunchState();
-        if (_launchTargetRunning && !_scanInProgress)
+
+        var exe = ResolveStartExecutable(out var targetKind);
+        if (string.IsNullOrWhiteSpace(exe))
         {
-            MessageBox.Show("Another instance of WoW or the launcher is already running. Please close it before starting again.", "Instance already running", MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
-        if (_settings.CleanWdbOnLaunch)
+        var launcherStart = targetKind == LaunchTargetKind.Launcher;
+        if (_launchTargetRunning && !_scanInProgress)
+        {
+            if (launcherStart)
+            {
+                await ShowLaunchInstanceDialogAsync(allowContinue: false);
+                return;
+            }
+
+            if (!await ShowLaunchInstanceDialogAsync(allowContinue: true))
+            {
+                return;
+            }
+        }
+
+        if (_settings.CleanWdbOnLaunch && !_launchTargetRunning)
         {
             var wdb = Path.Combine(_settings.InstallLocation, "WDB");
             if (Directory.Exists(wdb))
             {
-                Directory.Delete(wdb, recursive: true);
+                try
+                {
+                    Directory.Delete(wdb, recursive: true);
+                }
+                catch (Exception ex)
+                {
+                    AppLogger.Error($"Failed to clean WDB before launch. Path={wdb}", ex);
+                    await ShowInfoDialogAsync("WDB CLEANUP FAILED", $"Could not delete the WDB folder before launch.\n\n{ex.Message}");
+                    return;
+                }
             }
         }
-
-        var exe = _settings.GameStart switch
+        else if (_settings.CleanWdbOnLaunch && _launchTargetRunning)
         {
-            "WOW" => _settings.WowExecutable,
-            "Choose always" => ChooseStartExecutable(),
-            _ => _settings.LauncherExecutable
-        };
+            AppLogger.Warn("Skipped WDB cleanup because another WoW or launcher instance is running.");
+        }
 
         if (!string.IsNullOrWhiteSpace(exe) && File.Exists(exe))
         {
             Process.Start(new ProcessStartInfo(exe) { UseShellExecute = true });
-            Close();
+            await Task.Delay(500);
+            ApplyLaunchState();
         }
         else
         {
-            MessageBox.Show("Please configure a valid executable in Settings.", "Start option", MessageBoxButton.OK, MessageBoxImage.Information);
+            await ShowInfoDialogAsync("START OPTION", "Please configure a valid executable in Settings.");
         }
-        await Task.CompletedTask;
     }
 
     private void Retry_Click(object sender, RoutedEventArgs e)
@@ -1732,17 +1756,41 @@ public partial class MainWindow : Window
         MaximizeButton.Content = WindowState == WindowState.Maximized ? "\uE923" : "\uE922";
     }
 
-    private string ChooseStartExecutable()
+    private string ResolveStartExecutable(out LaunchTargetKind targetKind)
+    {
+        targetKind = _settings.GameStart switch
+        {
+            "WOW" => LaunchTargetKind.Wow,
+            "Choose always" => LaunchTargetKind.Unknown,
+            _ => LaunchTargetKind.Launcher
+        };
+
+        if (_settings.GameStart == "WOW")
+        {
+            return _settings.WowExecutable;
+        }
+
+        if (_settings.GameStart == "Choose always")
+        {
+            return ChooseStartExecutable(out targetKind);
+        }
+
+        return _settings.LauncherExecutable;
+    }
+
+    private string ChooseStartExecutable(out LaunchTargetKind targetKind)
     {
         var result = MessageBox.Show("Choose if you want to start the Launcher or WOW directly.\n\nYes = Launcher\nNo = WOW", "Start option", MessageBoxButton.YesNoCancel, MessageBoxImage.Question);
+        targetKind = result == MessageBoxResult.Yes ? LaunchTargetKind.Launcher : result == MessageBoxResult.No ? LaunchTargetKind.Wow : LaunchTargetKind.Unknown;
         return result == MessageBoxResult.Yes ? _settings.LauncherExecutable : result == MessageBoxResult.No ? _settings.WowExecutable : "";
     }
 
     private void StartProcessWatcher()
     {
-        _processTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _processTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
         _processTimer.Tick += (_, _) => ApplyLaunchState();
         _processTimer.Start();
+        ApplyLaunchState();
     }
 
     private void SetFooterStatus(string title, string subtitle = "")
@@ -1754,11 +1802,12 @@ public partial class MainWindow : Window
 
     private void ApplyLaunchState()
     {
-        _launchTargetRunning = IsLaunchTargetRunning();
+        (_launcherRunning, _wowRunning) = GetLaunchProcessState();
+        _launchTargetRunning = _launcherRunning || _wowRunning;
 
         if (_launchTargetRunning && !_scanInProgress)
         {
-            FooterStatus.Text = "Another instance of WoW or the launcher is running.";
+            FooterStatus.Text = GetRunningInstanceTitle();
             FooterSubStatus.Text = "Please close the game and retry if you want to update.";
             FooterSubStatus.Visibility = Visibility.Visible;
             RetryButton.Visibility = Visibility.Visible;
@@ -1775,27 +1824,42 @@ public partial class MainWindow : Window
         PlayButton.Foreground = Brush("#D8F06E");
     }
 
-    private bool IsLaunchTargetRunning()
+    private string GetRunningInstanceTitle()
     {
-        var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        if (_launcherRunning && _wowRunning)
         {
-            "Ascension Launcher",
-            "Ascension Launcher.exe",
-            "WoW",
-            "WoW.exe"
-        };
+            return "Another instance of WoW or the launcher is running.";
+        }
 
-        AddProcessName(names, _settings.LauncherExecutable);
-        AddProcessName(names, _settings.WowExecutable);
+        return _launcherRunning
+            ? "Another launcher instance is running."
+            : "Another instance of WoW is running.";
+    }
+
+    private (bool launcherRunning, bool wowRunning) GetLaunchProcessState()
+    {
+        var launcherNames = CreateProcessNames(_settings.LauncherExecutable, "Ascension Launcher", "Ascension Launcher.exe");
+        var wowNames = CreateProcessNames(_settings.WowExecutable, "WoW", "WoW.exe");
+        var launcherRunning = false;
+        var wowRunning = false;
 
         foreach (var process in Process.GetProcesses())
         {
             try
             {
                 var processName = process.ProcessName;
-                if (names.Contains(processName) || names.Contains(processName + ".exe"))
+                var processExe = processName + ".exe";
+                if (launcherNames.Contains(processName) || launcherNames.Contains(processExe))
                 {
-                    return true;
+                    launcherRunning = true;
+                }
+                if (wowNames.Contains(processName) || wowNames.Contains(processExe))
+                {
+                    wowRunning = true;
+                }
+                if (launcherRunning && wowRunning)
+                {
+                    return (true, true);
                 }
             }
             catch
@@ -1808,7 +1872,143 @@ public partial class MainWindow : Window
             }
         }
 
-        return false;
+        return (launcherRunning, wowRunning);
+    }
+
+    private static HashSet<string> CreateProcessNames(string? executable, params string[] defaults)
+    {
+        var names = new HashSet<string>(defaults, StringComparer.OrdinalIgnoreCase);
+        AddProcessName(names, executable);
+        return names;
+    }
+
+    private Task<bool> ShowLaunchInstanceDialogAsync(bool allowContinue)
+    {
+        var tcs = new TaskCompletionSource<bool>();
+        Overlay.Children.Clear();
+        Overlay.Visibility = Visibility.Visible;
+
+        var panel = new Border
+        {
+            Width = 620,
+            Height = allowContinue ? 350 : 322,
+            Background = Brush("#EA0F0D0C"),
+            BorderBrush = Brush("#302C29"),
+            BorderThickness = new Thickness(1),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var root = new Grid();
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(106) });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(allowContinue ? 154 : 126) });
+        root.RowDefinitions.Add(new RowDefinition());
+
+        var header = new Grid { Margin = new Thickness(24, 0, 14, 0) };
+        var titleBrush = new LinearGradientBrush
+        {
+            StartPoint = new Point(0, 0),
+            EndPoint = new Point(1, 0),
+            GradientStops =
+            {
+                new GradientStop(Color.FromRgb(255, 118, 63), 0),
+                new GradientStop(Color.FromRgb(255, 156, 62), 0.55),
+                new GradientStop(Color.FromRgb(244, 194, 70), 1)
+            }
+        };
+        header.Children.Add(new TextBlock
+        {
+            Text = "INSTANCE RUNNING",
+            Foreground = titleBrush,
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 36,
+            FontWeight = FontWeights.SemiBold,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        var close = new Button
+        {
+            Content = "\uE8BB",
+            FontFamily = new FontFamily("Segoe MDL2 Assets"),
+            FontSize = 18,
+            Foreground = Brush("#F4F0EA"),
+            Width = 44,
+            Height = 44,
+            Padding = new Thickness(0),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        close.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(false); };
+        header.Children.Add(close);
+        root.Children.Add(header);
+
+        var body = new Border
+        {
+            BorderBrush = Brush("#24201D"),
+            BorderThickness = new Thickness(0, 1, 0, 1),
+            Padding = new Thickness(24, 24, 24, 0)
+        };
+        var text = new TextBlock
+        {
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 21,
+            Foreground = Brush("#9B9A9A"),
+            TextWrapping = TextWrapping.Wrap,
+            LineHeight = 32
+        };
+        text.Inlines.Add(new Run(GetRunningInstanceTitle()) { Foreground = Brush("#F4F0EA"), FontWeight = FontWeights.SemiBold });
+        text.Inlines.Add(new Run("\n"));
+        text.Inlines.Add(allowContinue
+            ? new Run("You can still start another WoW instance if you want to.")
+            : new Run("Please close the running game or launcher before starting the launcher again."));
+        body.Child = text;
+        Grid.SetRow(body, 1);
+        root.Children.Add(body);
+
+        var footer = new Grid { Margin = new Thickness(24, 0, 28, 0) };
+        var cancel = new Button
+        {
+            Content = allowContinue ? "Cancel" : "OK",
+            Foreground = Brush("#BDB8B2"),
+            FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+            FontSize = 20,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        cancel.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(false); };
+        footer.Children.Add(cancel);
+
+        if (allowContinue)
+        {
+            var launch = new Button
+            {
+                Foreground = Brush("#FFB15F"),
+                FontFamily = new FontFamily("Roboto Condensed, Segoe UI"),
+                FontSize = 22,
+                FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0, 0, 120, 0)
+            };
+            var launchContent = new StackPanel { Orientation = Orientation.Horizontal };
+            launchContent.Children.Add(new TextBlock { Text = "\uE768", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 24, Margin = new Thickness(0, 0, 12, 0), VerticalAlignment = VerticalAlignment.Center });
+            launchContent.Children.Add(new TextBlock { Text = "Launch anyway", VerticalAlignment = VerticalAlignment.Center });
+            launch.Content = launchContent;
+            launch.Click += (_, _) => { CloseOverlay(); tcs.TrySetResult(true); };
+            footer.Children.Add(launch);
+        }
+
+        Grid.SetRow(footer, 2);
+        root.Children.Add(footer);
+
+        panel.Child = root;
+        Overlay.Children.Add(panel);
+        return tcs.Task;
+    }
+
+    private enum LaunchTargetKind
+    {
+        Unknown,
+        Launcher,
+        Wow
     }
 
     private static void AddProcessName(HashSet<string> names, string? executable)
