@@ -71,6 +71,7 @@ public partial class MainWindow : Window
         StartProcessWatcher();
         LoadAddonPlaceholders();
         await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
+        await MigrateLegacyZipInstallsAsync();
         RunLoggedAsync(ScanAsync(checkRemote: true), "Initial scan");
         AppLogger.Info("Main window initialization finished.");
     }
@@ -148,6 +149,87 @@ public partial class MainWindow : Window
         }
 
         RenderAddons();
+    }
+
+    private async Task MigrateLegacyZipInstallsAsync()
+    {
+        if (_settings.GitMigrationCompleted)
+        {
+            return;
+        }
+
+        var addonRoot = Path.Combine(_settings.InstallLocation, "Interface", "AddOns");
+        if (!Directory.Exists(addonRoot))
+        {
+            return;
+        }
+
+        var candidates = GetAddonDirectories(addonRoot)
+            .Where(d => !Directory.Exists(Path.Combine(d, ".git")) && File.Exists(Path.Combine(d, ".epoch-addon-updater.json")))
+            .ToList();
+
+        if (candidates.Count == 0)
+        {
+            _settings.GitMigrationCompleted = true;
+            SaveSettings();
+            return;
+        }
+
+        AppLogger.Info($"Legacy git metadata migration started. Candidates={candidates.Count}");
+        SetFooterStatus("Migrating addon installations...", "Preparing older updater installs for git updates.");
+        Progress.Value = 4;
+
+        var migrated = 0;
+        var failed = 0;
+        for (var i = 0; i < candidates.Count; i++)
+        {
+            var path = candidates[i];
+            var name = Path.GetFileName(path);
+            try
+            {
+                SetFooterStatus("Migrating addon installations...", name);
+                await MigrateLegacyZipInstallAsync(path);
+                migrated++;
+            }
+            catch (Exception ex)
+            {
+                failed++;
+                AppLogger.Error($"Legacy git metadata migration failed. Addon={name}; Path={path}", ex);
+            }
+            Progress.Value = 4 + (i + 1) * 20.0 / Math.Max(1, candidates.Count);
+        }
+
+        if (failed == 0)
+        {
+            _settings.GitMigrationCompleted = true;
+            SaveSettings();
+        }
+
+        LoadAddonPlaceholders();
+        AppLogger.Info($"Legacy git metadata migration finished. Migrated={migrated}; Failed={failed}");
+    }
+
+    private async Task MigrateLegacyZipInstallAsync(string target)
+    {
+        if (!TryReadRepoMetadata(target, out var metadata) || string.IsNullOrWhiteSpace(metadata.RepoUrl))
+        {
+            return;
+        }
+
+        var branch = await ResolveRemoteBranchAsync(metadata.RepoUrl, metadata.Branch, preferDefaultBranch: true);
+        var temp = CreateAddonTempDirectory(target);
+        Directory.CreateDirectory(temp);
+        try
+        {
+            await InstallOrUpdateGitAddonAsync(null, metadata.RepoUrl, branch, GetRepoName(metadata.RepoUrl), target, temp);
+        }
+        finally
+        {
+            if (Directory.Exists(temp))
+            {
+                DeleteDirectoryForce(temp);
+            }
+        }
     }
 
     private static List<string> GetAddonDirectories(string addonRoot)
@@ -471,11 +553,14 @@ public partial class MainWindow : Window
             return;
         }
 
-        addon.Branch = string.IsNullOrWhiteSpace(addon.Branch) ? "main" : addon.Branch;
+        addon.Branch = CleanBranchName(string.IsNullOrWhiteSpace(addon.Branch) ? "main" : addon.Branch);
         var branches = await RunGitAsync(_settings.InstallLocation, $"ls-remote --heads {addon.RepositoryUrl}");
         var branchCommits = ParseRemoteHeads(branches);
-        var parsedBranches = branches.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries)
+        var hasGitFolder = Directory.Exists(Path.Combine(addon.FolderPath, ".git"));
+        var parsedBranches = SplitLines(branches)
             .Select(l => l.Split("refs/heads/").LastOrDefault()?.Trim())
+            .Where(b => !string.IsNullOrWhiteSpace(b))
+            .Select(b => CleanBranchName(b!))
             .Where(b => !string.IsNullOrWhiteSpace(b))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToList();
@@ -484,15 +569,127 @@ public partial class MainWindow : Window
             addon.Branches = parsedBranches!;
         }
 
+        if (!hasGitFolder && TryParseGitHub(addon.RepositoryUrl, out var defaultOwner, out var defaultRepo))
+        {
+            var repoInfo = await GetGitHubRepositoryInfo(defaultOwner, defaultRepo);
+            var defaultBranch = CleanBranchName(repoInfo?.DefaultBranch ?? "");
+            if (!string.IsNullOrWhiteSpace(defaultBranch)
+                && branchCommits.ContainsKey(defaultBranch)
+                && !addon.Branch.Equals(defaultBranch, StringComparison.OrdinalIgnoreCase))
+            {
+                AppLogger.Warn($"Metadata-only addon branch differs from repository default branch. Addon={addon.FolderName}; ConfiguredBranch={addon.Branch}; DefaultBranch={defaultBranch}");
+                addon.Branch = defaultBranch;
+            }
+        }
+
+        if (!branchCommits.ContainsKey(addon.Branch))
+        {
+            var fallbackBranch = SelectFallbackBranch(branchCommits);
+            if (!string.IsNullOrWhiteSpace(fallbackBranch))
+            {
+                AppLogger.Warn($"Configured branch was not found. Addon={addon.FolderName}; ConfiguredBranch={addon.Branch}; FallbackBranch={fallbackBranch}");
+                addon.Branch = fallbackBranch;
+            }
+        }
+
         if (branchCommits.TryGetValue(addon.Branch, out var commit))
         {
             addon.RemoteCommit = commit;
             addon.HasUpdate = !string.IsNullOrWhiteSpace(addon.LocalCommit) && !addon.LocalCommit.Equals(commit, StringComparison.OrdinalIgnoreCase);
-            if (addon.HasUpdate && addon.Status == AddonStatus.Ok)
+        }
+
+        if (hasGitFolder)
+        {
+            var localCommit = await RunGitAsync(addon.FolderPath, "rev-parse HEAD");
+            if (!string.IsNullOrWhiteSpace(localCommit) && branchCommits.TryGetValue(addon.Branch, out var gitRemoteCommit))
             {
-                addon.StatusText = "Update";
+                addon.RemoteCommit = gitRemoteCommit;
+                addon.LocalCommit = localCommit;
+                addon.HasUpdate = !addon.LocalCommit.Equals(gitRemoteCommit, StringComparison.OrdinalIgnoreCase);
             }
         }
+
+        if (TryParseGitHub(addon.RepositoryUrl, out var owner, out var repo))
+        {
+            var remoteToc = await FindRemoteToc(owner, repo, addon.Branch);
+            if (!string.IsNullOrWhiteSpace(remoteToc))
+            {
+                var remoteMeta = ParseTocText(remoteToc);
+                var remoteVersion = remoteMeta.GetValueOrDefault("Version") ?? "";
+                if (IsRemoteVersionNewer(addon.Version, remoteVersion))
+                {
+                    AppLogger.Info($"Remote version update found. Addon={addon.FolderName}; LocalVersion={addon.Version}; RemoteVersion={remoteVersion}; Branch={addon.Branch}");
+                    addon.HasUpdate = true;
+                }
+            }
+        }
+
+        if (addon.HasUpdate && addon.Status == AddonStatus.Ok)
+        {
+            addon.StatusText = "Update";
+        }
+    }
+
+    private static string SelectFallbackBranch(Dictionary<string, string> branchCommits)
+    {
+        if (branchCommits.Count == 0)
+        {
+            return "";
+        }
+        if (branchCommits.ContainsKey("main"))
+        {
+            return "main";
+        }
+        if (branchCommits.ContainsKey("master"))
+        {
+            return "master";
+        }
+        return branchCommits.Keys.OrderBy(b => b, StringComparer.OrdinalIgnoreCase).First();
+    }
+
+    private static bool IsRemoteVersionNewer(string localVersion, string remoteVersion)
+    {
+        if (string.IsNullOrWhiteSpace(remoteVersion))
+        {
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(localVersion))
+        {
+            return true;
+        }
+
+        return CompareAddonVersions(localVersion, remoteVersion) < 0;
+    }
+
+    private static int CompareAddonVersions(string localVersion, string remoteVersion)
+    {
+        var localParts = ParseVersionParts(localVersion);
+        var remoteParts = ParseVersionParts(remoteVersion);
+        var count = Math.Max(localParts.Count, remoteParts.Count);
+        for (var i = 0; i < count; i++)
+        {
+            var local = i < localParts.Count ? localParts[i] : 0;
+            var remote = i < remoteParts.Count ? remoteParts[i] : 0;
+            var compare = local.CompareTo(remote);
+            if (compare != 0)
+            {
+                return compare;
+            }
+        }
+
+        return string.Compare(NormalizeVersionText(localVersion), NormalizeVersionText(remoteVersion), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<int> ParseVersionParts(string version)
+    {
+        return Regex.Matches(NormalizeVersionText(version), @"\d+")
+            .Select(m => int.TryParse(m.Value, out var value) ? value : 0)
+            .ToList();
+    }
+
+    private static string NormalizeVersionText(string version)
+    {
+        return version.Trim().TrimStart('v', 'V');
     }
 
     private async Task LoadRecommendedAddonsAsync(HashSet<string> installedFolderNames)
@@ -678,15 +875,30 @@ public partial class MainWindow : Window
     private static Dictionary<string, string> ParseRemoteHeads(string output)
     {
         var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var line in output.Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        foreach (var line in SplitLines(output))
         {
             var parts = line.Split(['\t', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
             if (parts.Length >= 2 && parts[1].StartsWith("refs/heads/", StringComparison.OrdinalIgnoreCase))
             {
-                result[parts[1]["refs/heads/".Length..]] = parts[0];
+                result[CleanBranchName(parts[1]["refs/heads/".Length..])] = parts[0];
             }
         }
         return result;
+    }
+
+    private static IEnumerable<string> SplitLines(string value)
+    {
+        return value.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+    }
+
+    private static string CleanBranchName(string branch)
+    {
+        if (string.IsNullOrWhiteSpace(branch))
+        {
+            return "";
+        }
+
+        return branch.Split(['\r', '\n', '\t', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).FirstOrDefault() ?? "";
     }
 
     private void RenderAddons()
@@ -1355,19 +1567,36 @@ public partial class MainWindow : Window
         stack.Children.Add(SectionTitle("Favorite Authors"));
         stack.Children.Add(BuildFavoriteAuthorsSettings());
 
-        stack.Children.Add(SectionTitle("Troubleshooting:"));
-        stack.Children.Add(LinkButton("Open log file", () =>
+        stack.Children.Add(BuildGeneralAndTroubleshootingSettings());
+    }
+
+    private FrameworkElement BuildGeneralAndTroubleshootingSettings()
+    {
+        var grid = new Grid { Margin = new Thickness(0, 4, 0, 0) };
+        grid.ColumnDefinitions.Add(new ColumnDefinition());
+        grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(28) });
+        grid.ColumnDefinitions.Add(new ColumnDefinition());
+
+        var general = new StackPanel();
+        general.Children.Add(SectionTitle("General Settings:"));
+        var clean = new CheckBox { Content = "Clean WDB on each launch", IsChecked = _settings.CleanWdbOnLaunch };
+        clean.Checked += (_, _) => { _settings.CleanWdbOnLaunch = true; SaveSettings(); };
+        clean.Unchecked += (_, _) => { _settings.CleanWdbOnLaunch = false; SaveSettings(); };
+        general.Children.Add(clean);
+        grid.Children.Add(general);
+
+        var troubleshooting = new StackPanel();
+        troubleshooting.Children.Add(SectionTitle("Troubleshooting:"));
+        troubleshooting.Children.Add(LinkButton("Open log file", () =>
         {
             var logs = Path.Combine(AppContext.BaseDirectory, "Logs");
             Directory.CreateDirectory(logs);
             OpenPath(logs);
         }));
+        Grid.SetColumn(troubleshooting, 2);
+        grid.Children.Add(troubleshooting);
 
-        stack.Children.Add(SectionTitle("General Settings:"));
-        var clean = new CheckBox { Content = "Clean WDB on each launch", IsChecked = _settings.CleanWdbOnLaunch };
-        clean.Checked += (_, _) => { _settings.CleanWdbOnLaunch = true; SaveSettings(); };
-        clean.Unchecked += (_, _) => { _settings.CleanWdbOnLaunch = false; SaveSettings(); };
-        stack.Children.Add(clean);
+        return grid;
     }
 
     private FrameworkElement BuildFavoriteAuthorsSettings()
@@ -1556,12 +1785,13 @@ public partial class MainWindow : Window
             return;
         }
 
-        branch = string.IsNullOrWhiteSpace(branch) ? "main" : branch;
+        var preferDefaultBranch = addon is not null && !Directory.Exists(Path.Combine(addon.FolderPath, ".git"));
+        branch = await ResolveRemoteBranchAsync(repoUrl, string.IsNullOrWhiteSpace(branch) ? "main" : branch, preferDefaultBranch);
         AppLogger.Info($"Update/install started. Repo={repoUrl}; Branch={branch}; ExistingAddon={addon?.FolderName ?? "<new>"}");
         SetFooterStatus($"Downloading {repoUrl}...");
         if (!TryParseGitHub(repoUrl, out var owner, out var repo))
         {
-            MessageBox.Show("Only GitHub repositories can be downloaded automatically in this version.", "Unsupported repository", MessageBoxButton.OK, MessageBoxImage.Information);
+            await ShowInfoDialogAsync("UNSUPPORTED REPOSITORY", "Only GitHub repositories can be downloaded automatically in this version.");
             return;
         }
 
@@ -1569,27 +1799,12 @@ public partial class MainWindow : Window
         var addonRoot = Path.Combine(_settings.InstallLocation, "Interface", "AddOns");
         Directory.CreateDirectory(addonRoot);
         var target = Path.Combine(addonRoot, targetName);
-        var temp = Path.Combine(Path.GetTempPath(), "EpochAddonUpdater", Guid.NewGuid().ToString("N"));
+        var temp = CreateAddonTempDirectory(target);
         Directory.CreateDirectory(temp);
 
         try
         {
-            var zipPath = Path.Combine(temp, "repo.zip");
-            var zipBytes = await _http.GetByteArrayAsync($"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{Uri.EscapeDataString(branch)}");
-            await File.WriteAllBytesAsync(zipPath, zipBytes);
-            ZipFile.ExtractToDirectory(zipPath, temp);
-            var root = Directory.GetDirectories(temp).First(d => Path.GetFileName(d).StartsWith(repo, StringComparison.OrdinalIgnoreCase));
-            var source = Directory.GetFiles(root, "*.toc", SearchOption.TopDirectoryOnly).Any()
-                ? root
-                : Directory.GetDirectories(root).FirstOrDefault(d => Directory.GetFiles(d, "*.toc", SearchOption.TopDirectoryOnly).Any()) ?? root;
-
-            if (Directory.Exists(target))
-            {
-                DeleteDirectoryForce(target);
-            }
-            CopyDirectory(source, target);
-            var installedCommit = await RunGitAsync(_settings.InstallLocation, $"ls-remote {repoUrl} refs/heads/{branch}");
-            SaveRepoMetadata(target, repoUrl, branch, installedCommit.Split(['\t', ' '], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "");
+            await InstallOrUpdateGitAddonAsync(addon, repoUrl, branch, repo, target, temp);
             SetFooterStatus("Addon updated.");
             await ScanAsync(checkRemote: true);
             AppLogger.Info($"Update/install finished. Repo={repoUrl}; Target={target}");
@@ -1597,7 +1812,7 @@ public partial class MainWindow : Window
         catch (Exception ex)
         {
             AppLogger.Error($"Update/install failed. Repo={repoUrl}; Target={target}", ex);
-            MessageBox.Show(ex.Message, "Update failed", MessageBoxButton.OK, MessageBoxImage.Error);
+            await ShowInfoDialogAsync("UPDATE FAILED", $"Could not update {targetName}.\n\n{ex.Message}");
             SetFooterStatus("Update failed.");
         }
         finally
@@ -1609,29 +1824,202 @@ public partial class MainWindow : Window
         }
     }
 
+    private async Task InstallOrUpdateGitAddonAsync(AddonInfo? addon, string repoUrl, string branch, string repo, string target, string temp)
+    {
+        var gitPath = Path.Combine(target, ".git");
+        if (Directory.Exists(gitPath))
+        {
+            AppLogger.Info($"Updating addon via git pull. Repo={repoUrl}; Branch={branch}; Target={target}");
+            await RunGitRequiredAsync(target, $"remote set-url origin {QuoteArg(repoUrl)}");
+            await RunGitRequiredAsync(target, "fetch --prune origin");
+            await RunGitRequiredAsync(target, $"checkout {QuoteArg(branch)}");
+            await RunGitRequiredAsync(target, $"pull --ff-only origin {QuoteArg(branch)}");
+            var commit = await RunGitAsync(target, "rev-parse HEAD");
+            SaveRepoMetadata(target, repoUrl, branch, commit);
+            return;
+        }
+
+        var cloneTarget = Path.Combine(temp, "clone");
+        AppLogger.Info($"Installing addon via git clone. Repo={repoUrl}; Branch={branch}; ExistingAddon={addon?.FolderName ?? "<new>"}; Target={target}");
+        await RunGitRequiredAsync(temp, $"clone --branch {QuoteArg(branch)} --single-branch {QuoteArg(repoUrl)} {QuoteArg(cloneTarget)}");
+
+        var source = Directory.GetFiles(cloneTarget, "*.toc", SearchOption.TopDirectoryOnly).Any()
+            ? cloneTarget
+            : Directory.GetDirectories(cloneTarget).FirstOrDefault(d => Directory.GetFiles(d, "*.toc", SearchOption.TopDirectoryOnly).Any()) ?? cloneTarget;
+
+        if (!source.Equals(cloneTarget, StringComparison.OrdinalIgnoreCase))
+        {
+            AppLogger.Warn($"Repository addon root is a subfolder; falling back to prepared folder swap without .git. Repo={repoUrl}; Source={source}");
+            var preparedTarget = Path.Combine(temp, "prepared-addon");
+            CopyDirectory(source, preparedTarget);
+            ReplaceDirectorySafely(preparedTarget, target);
+            var commit = await RunGitAsync(cloneTarget, "rev-parse HEAD");
+            SaveRepoMetadata(target, repoUrl, branch, commit);
+            return;
+        }
+
+        ReplaceDirectorySafely(cloneTarget, target);
+        var installedCommit = await RunGitAsync(target, "rev-parse HEAD");
+        SaveRepoMetadata(target, repoUrl, branch, installedCommit);
+    }
+
+    private static string CreateAddonTempDirectory(string target)
+    {
+        var addonRoot = Path.GetDirectoryName(target) ?? Path.GetTempPath();
+        return Path.Combine(addonRoot, ".epoch-addon-updater-temp", Guid.NewGuid().ToString("N"));
+    }
+
+    private static void ReplaceDirectorySafely(string preparedSource, string target)
+    {
+        var parent = Path.GetDirectoryName(target) ?? throw new InvalidOperationException($"Target has no parent directory: {target}");
+        Directory.CreateDirectory(parent);
+
+        var backup = Path.Combine(parent, $"{Path.GetFileName(target)}.epoch-backup-{Guid.NewGuid():N}");
+        var targetWasBackedUp = false;
+
+        try
+        {
+            if (Directory.Exists(target))
+            {
+                Directory.Move(target, backup);
+                targetWasBackedUp = true;
+            }
+
+            Directory.Move(preparedSource, target);
+
+            if (targetWasBackedUp && Directory.Exists(backup))
+            {
+                try
+                {
+                    DeleteDirectoryForce(backup);
+                }
+                catch (Exception backupDeleteEx)
+                {
+                    AppLogger.Warn($"Addon backup could not be deleted after successful replacement. Backup={backup}; Error={backupDeleteEx.Message}");
+                }
+            }
+        }
+        catch
+        {
+            try
+            {
+                if (Directory.Exists(target))
+                {
+                    DeleteDirectoryForce(target);
+                }
+
+                if (targetWasBackedUp && Directory.Exists(backup))
+                {
+                    Directory.Move(backup, target);
+                }
+            }
+            catch (Exception restoreEx)
+            {
+                AppLogger.Error($"Failed to restore addon backup after replacement error. Target={target}; Backup={backup}", restoreEx);
+            }
+
+            throw;
+        }
+    }
+
+    private async Task<byte[]> DownloadRepositoryZipAsync(string owner, string repo, string branch)
+    {
+        var branchPath = EscapeGitHubPath(branch);
+        var urls = new[]
+        {
+            $"https://github.com/{owner}/{repo}/archive/refs/heads/{branchPath}.zip",
+            $"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{branchPath}",
+            $"https://codeload.github.com/{owner}/{repo}/zip/{branchPath}"
+        };
+
+        Exception? lastError = null;
+        foreach (var url in urls)
+        {
+            try
+            {
+                AppLogger.Info($"Downloading repository archive. Url={url}");
+                return await _http.GetByteArrayAsync(url);
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+                AppLogger.Warn($"Repository archive download failed. Url={url}; Error={ex.Message}");
+            }
+        }
+
+        throw new InvalidOperationException($"Could not download repository archive for branch '{branch}'.", lastError);
+    }
+
+    private static string EscapeGitHubPath(string value)
+    {
+        return string.Join("/", value.Split('/').Select(Uri.EscapeDataString));
+    }
+
+    private async Task<string> ResolveRemoteBranchAsync(string repoUrl, string branch, bool preferDefaultBranch = false)
+    {
+        branch = CleanBranchName(branch);
+        var branches = await RunGitAsync(_settings.InstallLocation, $"ls-remote --heads {repoUrl}");
+        var branchCommits = ParseRemoteHeads(branches);
+        if (preferDefaultBranch && TryParseGitHub(repoUrl, out var owner, out var repo))
+        {
+            var repoInfo = await GetGitHubRepositoryInfo(owner, repo);
+            var defaultBranch = CleanBranchName(repoInfo?.DefaultBranch ?? "");
+            if (!string.IsNullOrWhiteSpace(defaultBranch) && branchCommits.ContainsKey(defaultBranch))
+            {
+                if (!branch.Equals(defaultBranch, StringComparison.OrdinalIgnoreCase))
+                {
+                    AppLogger.Warn($"Using repository default branch for metadata-only update. Repo={repoUrl}; ConfiguredBranch={branch}; DefaultBranch={defaultBranch}");
+                }
+                return defaultBranch;
+            }
+        }
+
+        if (branchCommits.ContainsKey(branch))
+        {
+            return branch;
+        }
+
+        var fallback = SelectFallbackBranch(branchCommits);
+        if (!string.IsNullOrWhiteSpace(fallback))
+        {
+            AppLogger.Warn($"Update branch was not found. Repo={repoUrl}; ConfiguredBranch={branch}; FallbackBranch={fallback}");
+            return fallback;
+        }
+
+        return branch;
+    }
+
     private static void LoadRepoMetadata(string path, AddonInfo addon)
     {
-        var metadataPath = Path.Combine(path, ".epoch-addon-updater.json");
-        if (!File.Exists(metadataPath))
+        if (!TryReadRepoMetadata(path, out var metadata))
         {
             return;
         }
 
+        addon.RepositoryUrl = string.IsNullOrWhiteSpace(addon.RepositoryUrl) ? metadata.RepoUrl : addon.RepositoryUrl;
+        addon.Branch = string.IsNullOrWhiteSpace(addon.Branch) ? metadata.Branch : addon.Branch;
+        addon.LocalCommit = string.IsNullOrWhiteSpace(addon.LocalCommit) ? metadata.Commit : addon.LocalCommit;
+    }
+
+    private static bool TryReadRepoMetadata(string path, out RepoInstallMetadata metadata)
+    {
+        metadata = new RepoInstallMetadata();
+        var metadataPath = Path.Combine(path, ".epoch-addon-updater.json");
+        if (!File.Exists(metadataPath))
+        {
+            return false;
+        }
+
         try
         {
-            var metadata = JsonSerializer.Deserialize<RepoInstallMetadata>(File.ReadAllText(metadataPath));
-            if (metadata is null)
-            {
-                return;
-            }
-            addon.RepositoryUrl = string.IsNullOrWhiteSpace(addon.RepositoryUrl) ? metadata.RepoUrl : addon.RepositoryUrl;
-            addon.Branch = string.IsNullOrWhiteSpace(addon.Branch) ? metadata.Branch : addon.Branch;
-            addon.LocalCommit = string.IsNullOrWhiteSpace(addon.LocalCommit) ? metadata.Commit : addon.LocalCommit;
+            metadata = JsonSerializer.Deserialize<RepoInstallMetadata>(File.ReadAllText(metadataPath)) ?? new RepoInstallMetadata();
+            return !string.IsNullOrWhiteSpace(metadata.RepoUrl);
         }
         catch
         {
             AppLogger.Warn($"Failed to read repo metadata: {metadataPath}");
             // Bad metadata should not make the addon fail verification.
+            return false;
         }
     }
 
@@ -2188,6 +2576,42 @@ public partial class MainWindow : Window
         }
     }
 
+    private static async Task<string> RunGitRequiredAsync(string workingDirectory, string args)
+    {
+        var psi = new ProcessStartInfo("git", args)
+        {
+            WorkingDirectory = workingDirectory,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+        using var process = Process.Start(psi) ?? throw new InvalidOperationException("Could not start git.");
+        var outputTask = process.StandardOutput.ReadToEndAsync();
+        var errorTask = process.StandardError.ReadToEndAsync();
+        var exitTask = process.WaitForExitAsync();
+        if (await Task.WhenAny(exitTask, Task.Delay(TimeSpan.FromMinutes(2))) != exitTask)
+        {
+            try { process.Kill(entireProcessTree: true); } catch { }
+            throw new TimeoutException($"Git command timed out: git {args}");
+        }
+
+        var output = await outputTask;
+        var error = await errorTask;
+        if (process.ExitCode != 0)
+        {
+            AppLogger.Warn($"Git required command failed. ExitCode={process.ExitCode}; WorkingDirectory={workingDirectory}; Args={args}; Error={error}");
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? $"Git command failed: git {args}" : error.Trim());
+        }
+
+        return output.Trim();
+    }
+
+    private static string QuoteArg(string value)
+    {
+        return "\"" + value.Replace("\"", "\\\"") + "\"";
+    }
+
     private async Task<string?> TryHttpString(string url)
     {
         try { return await _http.GetStringAsync(url); }
@@ -2229,6 +2653,13 @@ public partial class MainWindow : Window
     {
         if (string.IsNullOrWhiteSpace(url)) return "";
         return url.Trim().TrimEnd('/').Replace(".git", "", StringComparison.OrdinalIgnoreCase).ToLowerInvariant();
+    }
+
+    private static string GetRepoName(string url)
+    {
+        var normalized = url.Trim().TrimEnd('/').Replace(".git", "", StringComparison.OrdinalIgnoreCase);
+        var parts = normalized.Split(['/', ':'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        return parts.LastOrDefault() ?? "addon";
     }
 
     private static string CleanTitle(string text) => Regex.Replace(text, @"\|c[0-9A-Fa-f]{8}|\|r|\|n", "").Trim();
@@ -2340,6 +2771,7 @@ public sealed class AppSettings
     public string LauncherExecutable { get; set; } = "";
     public string WowExecutable { get; set; } = "";
     public bool CleanWdbOnLaunch { get; set; }
+    public bool GitMigrationCompleted { get; set; }
     public List<string> IgnoredAddons { get; set; } = [];
     public List<string> FavoriteAuthorUrls { get; set; } = ["https://github.com/Fragglechen"];
 }

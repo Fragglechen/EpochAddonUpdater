@@ -1,0 +1,11 @@
+Project Epoch Addon Updater Changelog
+
+Version 1.0.1
+- Restored Git-based update handling for addons that were originally installed from repository metadata.
+- Added a one-time legacy migration for older ZIP-based updater installs.
+- Made migration and Git install/update replacement safer by preparing the new addon first, backing up the existing addon folder, and restoring it automatically if replacement fails.
+- Fixed cross-drive migration failures when temporary files were created on a different drive than the WoW AddOns folder.
+- Improved branch detection by resolving repository default branches and falling back cleanly when configured branches no longer exist.
+- Added remote TOC version checks so updates are detected even when commit metadata is missing or stale.
+- Improved update error reporting by showing updater-styled dialogs instead of raw Windows message boxes.
+- Kept restored addons as real Git checkouts so future updates can use Git directly.
