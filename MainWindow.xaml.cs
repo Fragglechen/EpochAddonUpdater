@@ -7,6 +7,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Text.Json;
@@ -1304,8 +1305,15 @@ public partial class MainWindow : Window
         {
             stack.Children.Add(Notice(addon.Problem, "#F0CC17"));
         }
-        stack.Children.Add(new TextBlock { Text = string.IsNullOrWhiteSpace(addon.Readme) ? addon.Description : SimplifyMarkdown(addon.Readme), FontSize = 18, TextWrapping = TextWrapping.Wrap, LineHeight = 28 });
-        content.Children.Add(new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
+        stack.Children.Add(BuildAddonDetailsDescription(addon));
+        if (string.IsNullOrWhiteSpace(addon.Readme))
+        {
+            content.Children.Add(new ScrollViewer { Content = stack, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled });
+        }
+        else
+        {
+            content.Children.Add(stack);
+        }
 
         var meta = new StackPanel { Margin = new Thickness(18, 0, 0, 0) };
         meta.Children.Add(LinkButton($"Files: Open folder", () => OpenPath(addon.FolderPath)));
@@ -1375,6 +1383,141 @@ public partial class MainWindow : Window
         {
             addon.Readme = File.ReadAllText(readme);
         }
+    }
+
+    private FrameworkElement BuildAddonDetailsDescription(AddonInfo addon)
+    {
+        if (string.IsNullOrWhiteSpace(addon.Readme))
+        {
+            return new TextBlock
+            {
+                Text = addon.Description,
+                FontSize = 18,
+                TextWrapping = TextWrapping.Wrap,
+                LineHeight = 28
+            };
+        }
+
+        var browser = new WebBrowser
+        {
+            Height = 430
+        };
+        browser.Loaded += (_, _) => browser.NavigateToString(BuildReadmeHtml(addon.Readme, addon.FolderPath));
+        return new Border
+        {
+            Height = 430,
+            Background = Brush("#0B0908"),
+            Child = browser
+        };
+    }
+
+    private static string BuildReadmeHtml(string readme, string basePath)
+    {
+        var body = LooksLikeHtml(readme) ? readme : ConvertSimpleMarkdownToHtml(readme, basePath);
+        var baseUri = new Uri(basePath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar).AbsoluteUri;
+        return $$"""
+<!doctype html>
+<html>
+<head>
+<meta http-equiv="X-UA-Compatible" content="IE=edge" />
+<meta charset="utf-8" />
+<base href="{{WebUtility.HtmlEncode(baseUri)}}" />
+<style>
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #0b0908;
+  color: #bdb8b2;
+  font-family: 'Segoe UI', Arial, sans-serif;
+  font-size: 19px;
+  line-height: 1.65;
+  scrollbar-face-color: #5a534d;
+  scrollbar-track-color: #120f0d;
+  scrollbar-arrow-color: #f4f0ea;
+  scrollbar-shadow-color: #120f0d;
+  scrollbar-highlight-color: #ff9146;
+  scrollbar-darkshadow-color: #050403;
+  scrollbar-3dlight-color: #302c29;
+}
+::-webkit-scrollbar { width: 12px; height: 12px; }
+::-webkit-scrollbar-track { background: #120f0d; }
+::-webkit-scrollbar-thumb { background: #5a534d; border: 2px solid #120f0d; }
+::-webkit-scrollbar-thumb:hover { background: #ff9146; }
+::-webkit-scrollbar-corner { background: #120f0d; }
+a { color: #ff9146; text-decoration: none; }
+h1 { font-size: 30px; }
+h2 { font-size: 26px; }
+h3 { font-size: 22px; }
+h1, h2, h3 { color: #f4f0ea; font-weight: 600; margin: 0 0 12px 0; }
+p { margin: 0 0 14px 0; }
+img { max-width: 100%; height: auto; display: block; margin: 10px 0 14px 0; }
+code, pre { color: #d9dd51; background: #181210; }
+</style>
+</head>
+<body>{{body}}</body>
+</html>
+""";
+    }
+
+    private static bool LooksLikeHtml(string value)
+    {
+        return Regex.IsMatch(value, @"<\s*(img|p|br|div|span|table|h[1-6]|ul|ol|li|a)\b", RegexOptions.IgnoreCase);
+    }
+
+    private static string ConvertSimpleMarkdownToHtml(string markdown, string basePath)
+    {
+        var lines = markdown.Replace("\r\n", "\n").Split('\n');
+        var html = new System.Text.StringBuilder();
+        foreach (var rawLine in lines)
+        {
+            var line = rawLine.TrimEnd();
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            var heading = Regex.Match(line, @"^(#{1,3})\s+(.+)$");
+            if (heading.Success)
+            {
+                var level = heading.Groups[1].Value.Length;
+                html.Append("<h").Append(level).Append('>').Append(ConvertInlineMarkdown(heading.Groups[2].Value, basePath)).Append("</h").Append(level).Append('>');
+                continue;
+            }
+
+            html.Append("<p>").Append(ConvertInlineMarkdown(line, basePath)).Append("</p>");
+        }
+        return html.ToString();
+    }
+
+    private static string ConvertInlineMarkdown(string text, string basePath)
+    {
+        var encoded = WebUtility.HtmlEncode(text);
+        encoded = Regex.Replace(encoded, @"!\[([^\]]*)\]\(([^)]+)\)", match =>
+        {
+            var alt = match.Groups[1].Value;
+            var src = ResolveReadmeUrl(WebUtility.HtmlDecode(match.Groups[2].Value), basePath);
+            return $"<img src=\"{WebUtility.HtmlEncode(src)}\" alt=\"{alt}\" />";
+        });
+        encoded = Regex.Replace(encoded, @"\[([^\]]+)\]\(([^)]+)\)", match =>
+        {
+            var label = match.Groups[1].Value;
+            var href = ResolveReadmeUrl(WebUtility.HtmlDecode(match.Groups[2].Value), basePath);
+            return $"<a href=\"{WebUtility.HtmlEncode(href)}\">{label}</a>";
+        });
+        encoded = Regex.Replace(encoded, @"\*\*([^*]+)\*\*", "<strong>$1</strong>");
+        encoded = Regex.Replace(encoded, @"`([^`]+)`", "<code>$1</code>");
+        return encoded;
+    }
+
+    private static string ResolveReadmeUrl(string value, string basePath)
+    {
+        var cleaned = value.Trim().Trim('"', '\'');
+        if (Uri.TryCreate(cleaned, UriKind.Absolute, out var absolute))
+        {
+            return absolute.ToString();
+        }
+        var fullPath = Path.GetFullPath(Path.Combine(basePath, cleaned.Replace('/', Path.DirectorySeparatorChar)));
+        return new Uri(fullPath).AbsoluteUri;
     }
 
     private void ShowRepoDialog(string title, AddonInfo? existing)
