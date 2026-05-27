@@ -1,5 +1,11 @@
 Project Epoch Addon Updater Changelog
 
+Version 1.0.2
+- Stopped legacy migration from replacing or deleting existing non-git addon folders.
+- Removed the experimental Git addon switch/search flow.
+- Shortened the displayed app version by hiding build metadata after the version number.
+- Restored the bug button action so it opens the GitHub issue form.
+
 Version 1.0.1
 - Restored Git-based update handling for addons that were originally installed from repository metadata.
 - Added a one-time legacy migration for older ZIP-based updater installs.
