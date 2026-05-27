@@ -68,6 +68,7 @@ public partial class MainWindow : Window
                 new TextBlock { Text = $"v{GetAppVersion()}", FontSize = 12 }
             }
         };
+        VersionButton.ToolTip = "Report a bug";
         StartProcessWatcher();
         LoadAddonPlaceholders();
         await Dispatcher.InvokeAsync(() => { }, System.Windows.Threading.DispatcherPriority.ContextIdle);
@@ -176,37 +177,10 @@ public partial class MainWindow : Window
         }
 
         AppLogger.Info($"Legacy git metadata migration started. Candidates={candidates.Count}");
-        SetFooterStatus("Migrating addon installations...", "Preparing older updater installs for git updates.");
-        Progress.Value = 4;
-
-        var migrated = 0;
-        var failed = 0;
-        for (var i = 0; i < candidates.Count; i++)
-        {
-            var path = candidates[i];
-            var name = Path.GetFileName(path);
-            try
-            {
-                SetFooterStatus("Migrating addon installations...", name);
-                await MigrateLegacyZipInstallAsync(path);
-                migrated++;
-            }
-            catch (Exception ex)
-            {
-                failed++;
-                AppLogger.Error($"Legacy git metadata migration failed. Addon={name}; Path={path}", ex);
-            }
-            Progress.Value = 4 + (i + 1) * 20.0 / Math.Max(1, candidates.Count);
-        }
-
-        if (failed == 0)
-        {
-            _settings.GitMigrationCompleted = true;
-            SaveSettings();
-        }
-
-        LoadAddonPlaceholders();
-        AppLogger.Info($"Legacy git metadata migration finished. Migrated={migrated}; Failed={failed}");
+        _settings.GitMigrationCompleted = true;
+        SaveSettings();
+        AppLogger.Info("Legacy git metadata migration marked as completed. Existing non-git addon folders are left untouched.");
+        await Task.CompletedTask;
     }
 
     private async Task MigrateLegacyZipInstallAsync(string target)
@@ -2110,6 +2084,7 @@ public partial class MainWindow : Window
 
     private void VersionButton_Click(object sender, RoutedEventArgs e)
     {
+        OpenPath("https://github.com/Fragglechen/EpochAddonUpdater/issues/new");
     }
 
     private void TitleBar_MouseLeftButtonDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
@@ -2419,9 +2394,10 @@ public partial class MainWindow : Window
     }
     private static string GetAppVersion()
     {
-        return Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
+        var version = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
             ?? Assembly.GetExecutingAssembly().GetName().Version?.ToString(3)
             ?? "1.0.0";
+        return version.Split('+')[0];
     }
 
     private void SearchBox_TextChanged(object sender, TextChangedEventArgs e) => RenderAddons();
