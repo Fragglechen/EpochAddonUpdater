@@ -1,7 +1,7 @@
 Project Epoch Addon Updater
 
 Author: Fragglechen
-Version: 1.0.2
+Version: 1.0.3
 
 This tool manages Project Epoch addons for the Ascension WoW launcher resources folder.
 

@@ -1,5 +1,9 @@
 Project Epoch Addon Updater Changelog
 
+Version 1.0.3
+- Added automatic repair for broken Git remote-tracking refs during addon updates.
+- The updater now retries fetch after removing only the inconsistent refs/remotes/* entry reported by Git.
+
 Version 1.0.2
 - Stopped legacy migration from replacing or deleting existing non-git addon folders.
 - Removed the experimental Git addon switch/search flow.

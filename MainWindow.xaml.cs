@@ -1948,7 +1948,7 @@ code, pre { color: #d9dd51; background: #181210; }
         {
             AppLogger.Info($"Updating addon via git pull. Repo={repoUrl}; Branch={branch}; Target={target}");
             await RunGitRequiredAsync(target, $"remote set-url origin {QuoteArg(repoUrl)}");
-            await RunGitRequiredAsync(target, "fetch --prune origin");
+            await FetchOriginWithRefRepairAsync(target);
             await RunGitRequiredAsync(target, $"checkout {QuoteArg(branch)}");
             await RunGitRequiredAsync(target, $"pull --ff-only origin {QuoteArg(branch)}");
             var commit = await RunGitAsync(target, "rev-parse HEAD");
@@ -1978,6 +1978,40 @@ code, pre { color: #d9dd51; background: #181210; }
         ReplaceDirectorySafely(cloneTarget, target);
         var installedCommit = await RunGitAsync(target, "rev-parse HEAD");
         SaveRepoMetadata(target, repoUrl, branch, installedCommit);
+    }
+
+    private static async Task FetchOriginWithRefRepairAsync(string target)
+    {
+        try
+        {
+            await RunGitRequiredAsync(target, "fetch --prune origin");
+        }
+        catch (InvalidOperationException ex) when (TryExtractBrokenRemoteRef(ex.Message, out var remoteRef))
+        {
+            AppLogger.Warn($"Git fetch failed because a remote tracking ref is inconsistent. Target={target}; Ref={remoteRef}; attempting repair.");
+            await RunGitRequiredAsync(target, $"update-ref -d {QuoteArg(remoteRef)}");
+            await RunGitRequiredAsync(target, "fetch --prune origin");
+        }
+    }
+
+    private static bool TryExtractBrokenRemoteRef(string gitError, out string remoteRef)
+    {
+        remoteRef = "";
+        if (string.IsNullOrWhiteSpace(gitError)
+            || !gitError.Contains("cannot lock ref", StringComparison.OrdinalIgnoreCase)
+            || !gitError.Contains("refs/remotes/", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var match = Regex.Match(gitError, @"cannot lock ref ['""](?<ref>refs/remotes/[^'""]+)['""]", RegexOptions.IgnoreCase);
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        remoteRef = match.Groups["ref"].Value.Trim();
+        return remoteRef.StartsWith("refs/remotes/", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string CreateAddonTempDirectory(string target)
