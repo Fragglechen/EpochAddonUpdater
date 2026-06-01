@@ -1950,7 +1950,7 @@ code, pre { color: #d9dd51; background: #181210; }
             await RunGitRequiredAsync(target, $"remote set-url origin {QuoteArg(repoUrl)}");
             await FetchOriginWithRefRepairAsync(target);
             await RunGitRequiredAsync(target, $"checkout {QuoteArg(branch)}");
-            await RunGitRequiredAsync(target, $"pull --ff-only origin {QuoteArg(branch)}");
+            await RunGitRequiredAsync(target, $"merge --ff-only {QuoteArg($"refs/remotes/origin/{branch}")}");
             var commit = await RunGitAsync(target, "rev-parse HEAD");
             SaveRepoMetadata(target, repoUrl, branch, commit);
             return;
