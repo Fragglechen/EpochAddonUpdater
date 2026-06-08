@@ -8,15 +8,17 @@
     <UseWPF>true</UseWPF>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationIcon>Assets\epoch-icon.ico</ApplicationIcon>
-    <Version>1.0.4</Version>
-    <AssemblyVersion>1.0.4.0</AssemblyVersion>
-    <FileVersion>1.0.4.0</FileVersion>
+    <Version>1.0.5</Version>
+    <AssemblyVersion>1.0.5.0</AssemblyVersion>
+    <FileVersion>1.0.5.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
     <Resource Include="Assets\epoch-logo.png" />
     <Resource Include="Assets\LauncherBackgrounds\*.webp" />
     <Resource Include="Assets\epoch-icon.ico" />
+    <EmbeddedResource Include="Assets\Runtime\MinGit-2.54.0-64-bit.zip" LogicalName="EpochAddonUpdater.MinGit.zip" />
+    <EmbeddedResource Include="ThirdPartyNotices.txt" LogicalName="EpochAddonUpdater.ThirdPartyNotices.txt" />
   </ItemGroup>
 
 </Project>

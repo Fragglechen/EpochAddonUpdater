@@ -26,6 +26,11 @@ namespace EpochAddonUpdater;
 public partial class MainWindow : Window
 {
     private const string ExpectedInterface = "30300";
+    private const string BundledGitVersion = "2.54.0";
+    private const string BundledGitResourceName = "EpochAddonUpdater.MinGit.zip";
+    private const string ThirdPartyNoticesResourceName = "EpochAddonUpdater.ThirdPartyNotices.txt";
+    private static readonly object GitResolveLock = new();
+    private static string? _gitExecutable;
     private readonly ObservableCollection<AddonInfo> _addons = [];
     private readonly ObservableCollection<AddonInfo> _recommendedAddons = [];
     private readonly ObservableCollection<AddonInfo> _visibleAddons = [];
@@ -2687,7 +2692,7 @@ code, pre { color: #d9dd51; background: #181210; }
     {
         try
         {
-            var psi = new ProcessStartInfo("git", args) { WorkingDirectory = workingDirectory, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+            var psi = new ProcessStartInfo(ResolveGitExecutable(), args) { WorkingDirectory = workingDirectory, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
             using var process = Process.Start(psi);
             if (process is null) return "";
             var output = process.StandardOutput.ReadToEnd().Trim();
@@ -2704,7 +2709,7 @@ code, pre { color: #d9dd51; background: #181210; }
     {
         try
         {
-            var psi = new ProcessStartInfo("git", args) { WorkingDirectory = workingDirectory, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
+            var psi = new ProcessStartInfo(ResolveGitExecutable(), args) { WorkingDirectory = workingDirectory, RedirectStandardOutput = true, RedirectStandardError = true, UseShellExecute = false, CreateNoWindow = true };
             using var process = Process.Start(psi);
             if (process is null) return "";
             var outputTask = process.StandardOutput.ReadToEndAsync();
@@ -2731,7 +2736,7 @@ code, pre { color: #d9dd51; background: #181210; }
 
     private static async Task<string> RunGitRequiredAsync(string workingDirectory, string args)
     {
-        var psi = new ProcessStartInfo("git", args)
+        var psi = new ProcessStartInfo(ResolveGitExecutable(), args)
         {
             WorkingDirectory = workingDirectory,
             RedirectStandardOutput = true,
@@ -2758,6 +2763,172 @@ code, pre { color: #d9dd51; background: #181210; }
         }
 
         return output.Trim();
+    }
+
+    private static string ResolveGitExecutable()
+    {
+        lock (GitResolveLock)
+        {
+            if (!string.IsNullOrWhiteSpace(_gitExecutable) && File.Exists(_gitExecutable))
+            {
+                return _gitExecutable;
+            }
+
+            var systemGit = FindSystemGitExecutable();
+            if (!string.IsNullOrWhiteSpace(systemGit))
+            {
+                _gitExecutable = systemGit;
+                AppLogger.Info($"Using installed Git: {_gitExecutable}");
+                return _gitExecutable;
+            }
+
+            _gitExecutable = EnsureBundledGitExtracted();
+            AppLogger.Info($"Installed Git was not found. Using bundled MinGit {BundledGitVersion}: {_gitExecutable}");
+            return _gitExecutable;
+        }
+    }
+
+    private static string? FindSystemGitExecutable()
+    {
+        var candidates = new List<string>();
+        var path = Environment.GetEnvironmentVariable("PATH");
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            candidates.AddRange(path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+                .Select(directory => Path.Combine(directory.Trim().Trim('"'), "git.exe")));
+        }
+
+        AddGitCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Git", "cmd", "git.exe");
+        AddGitCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Git", "bin", "git.exe");
+        AddGitCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Git", "cmd", "git.exe");
+        AddGitCandidate(candidates, Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", "Git", "cmd", "git.exe");
+
+        return candidates
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault(IsWorkingGitExecutable);
+    }
+
+    private static void AddGitCandidate(List<string> candidates, string root, params string[] parts)
+    {
+        if (!string.IsNullOrWhiteSpace(root))
+        {
+            candidates.Add(Path.Combine([root, .. parts]));
+        }
+    }
+
+    private static bool IsWorkingGitExecutable(string candidate)
+    {
+        if (!File.Exists(candidate))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var process = Process.Start(new ProcessStartInfo(candidate, "--version")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            });
+            if (process is null || !process.WaitForExit(3000))
+            {
+                try { process?.Kill(entireProcessTree: true); } catch { }
+                return false;
+            }
+
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string EnsureBundledGitExtracted()
+    {
+        var gitRoot = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "EpochAddonUpdater",
+            "Git",
+            BundledGitVersion);
+        var gitExecutable = Path.Combine(gitRoot, "cmd", "git.exe");
+        var completionMarker = Path.Combine(gitRoot, ".complete");
+        if (File.Exists(gitExecutable) && File.Exists(completionMarker))
+        {
+            return gitExecutable;
+        }
+
+        var parent = Directory.GetParent(gitRoot)?.FullName
+            ?? throw new InvalidOperationException("Could not determine the bundled Git installation folder.");
+        Directory.CreateDirectory(parent);
+        var staging = Path.Combine(parent, $"{BundledGitVersion}-staging-{Guid.NewGuid():N}");
+
+        try
+        {
+            Directory.CreateDirectory(staging);
+            using var archiveStream = Assembly.GetExecutingAssembly().GetManifestResourceStream(BundledGitResourceName)
+                ?? throw new InvalidOperationException("The bundled MinGit archive is missing.");
+            using var archive = new ZipArchive(archiveStream, ZipArchiveMode.Read);
+            var stagingPrefix = Path.GetFullPath(staging) + Path.DirectorySeparatorChar;
+
+            foreach (var entry in archive.Entries)
+            {
+                var target = Path.GetFullPath(Path.Combine(staging, entry.FullName));
+                if (!target.StartsWith(stagingPrefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("The bundled MinGit archive contains an invalid path.");
+                }
+
+                if (string.IsNullOrEmpty(entry.Name))
+                {
+                    Directory.CreateDirectory(target);
+                    continue;
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                entry.ExtractToFile(target, overwrite: true);
+            }
+
+            WriteEmbeddedTextResource(ThirdPartyNoticesResourceName, Path.Combine(staging, "ThirdPartyNotices.txt"));
+            File.WriteAllText(Path.Combine(staging, ".complete"), BundledGitVersion);
+
+            if (Directory.Exists(gitRoot))
+            {
+                Directory.Delete(gitRoot, recursive: true);
+            }
+
+            Directory.Move(staging, gitRoot);
+            if (!File.Exists(gitExecutable))
+            {
+                throw new InvalidOperationException("The bundled MinGit executable is missing after extraction.");
+            }
+
+            return gitExecutable;
+        }
+        catch (Exception ex)
+        {
+            AppLogger.Error("Bundled MinGit extraction failed.", ex);
+            throw new InvalidOperationException(
+                "Git is not installed and the bundled portable Git could not be prepared. Please check the updater log.",
+                ex);
+        }
+        finally
+        {
+            if (Directory.Exists(staging))
+            {
+                try { Directory.Delete(staging, recursive: true); } catch { }
+            }
+        }
+    }
+
+    private static void WriteEmbeddedTextResource(string resourceName, string targetPath)
+    {
+        using var stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName)
+            ?? throw new InvalidOperationException($"Embedded resource '{resourceName}' is missing.");
+        using var reader = new StreamReader(stream);
+        File.WriteAllText(targetPath, reader.ReadToEnd());
     }
 
     private static string QuoteArg(string value)

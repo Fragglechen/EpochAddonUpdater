@@ -1,0 +1,17 @@
+Third-Party Notices
+
+MinGit for Windows 2.54.0
+
+This application bundles the official, unchanged MinGit-2.54.0-64-bit.zip
+archive from Git for Windows v2.54.0.windows.1.
+
+Binary download:
+https://github.com/git-for-windows/git/releases/tag/v2.54.0.windows.1
+
+Source code:
+https://github.com/git-for-windows/git/tree/v2.54.0.windows.1
+
+Git is licensed under the GNU General Public License version 2. MinGit also
+contains third-party components with their own licenses. Their license files
+are included in the unchanged MinGit archive and are extracted together with
+the portable Git runtime.

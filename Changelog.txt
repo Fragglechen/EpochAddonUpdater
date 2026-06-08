@@ -1,5 +1,11 @@
 Project Epoch Addon Updater Changelog
 
+Version 1.0.5
+- Added an official bundled MinGit runtime so addon installs and updates work without a system-wide Git installation.
+- Added automatic detection and validation of an installed Git version, which remains preferred when available.
+- Added one-time, versioned extraction of bundled MinGit to the user's local application data folder.
+- Added third-party notices and preserved the licenses included with the official unchanged MinGit archive.
+
 Version 1.0.4
 - Changed Git addon updates to use fetch plus an explicit fast-forward merge against refs/remotes/origin/<branch>.
 - Fixed update failures where Git reported "Cannot fast-forward to multiple branches" during pull.

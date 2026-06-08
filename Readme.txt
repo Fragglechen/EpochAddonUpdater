@@ -1,7 +1,7 @@
 Project Epoch Addon Updater
 
 Author: Fragglechen
-Version: 1.0.4
+Version: 1.0.5
 
 This tool manages Project Epoch addons for the Ascension WoW launcher resources folder.
 
@@ -10,6 +10,7 @@ Features:
 - Verifies addon metadata in the background.
 - Checks configured Git repositories for updates.
 - Installs or updates addons from Git repositories.
+- Uses an installed Git version when available and bundled portable MinGit otherwise.
 - Ignores Blizzard_* interface folders.
 
 Start:
